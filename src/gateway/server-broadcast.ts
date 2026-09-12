@@ -79,6 +79,7 @@ const EVENT_SCOPE_GUARDS: Record<string, string[]> = {
   "users.prefs.changed": [READ_SCOPE],
   "mentions.changed": [READ_SCOPE],
   "skills.changed": [READ_SCOPE],
+  "plugins.changed": [READ_SCOPE],
   "voicewake.changed": [READ_SCOPE],
   "voicewake.routing.changed": [READ_SCOPE],
   [GATEWAY_EVENT_DEVICE_PAIR_CHANGED]: [PAIRING_SCOPE],
@@ -361,6 +362,8 @@ export function createGatewayBroadcaster(params: {
       event === "presence" ? (payload as { presence: SystemPresence[] }) : undefined;
     let projectPresence: ((client: GatewayWsClient) => SystemPresence[]) | undefined;
     let outboundEventLogged = false;
+    let lastFrameSequence = 0;
+    let lastFrame: string | undefined;
     let frameBase: FrameBase | undefined = retained?.base;
     let frameFields: Omit<FrameBase, "payloadFragment"> | undefined;
     const frameBaseFor = (value: unknown): FrameBase => {
@@ -588,7 +591,15 @@ export function createGatewayBroadcaster(params: {
             presence: projectPresence(c),
           });
         }
-        frame = frameWithSequence(base, nextSeq, payloadFragment);
+        if (!presencePayload && lastFrame !== undefined && lastFrameSequence === nextSeq) {
+          frame = lastFrame;
+        } else {
+          frame = frameWithSequence(base, nextSeq, payloadFragment);
+          if (!presencePayload) {
+            lastFrameSequence = nextSeq;
+            lastFrame = frame;
+          }
+        }
       } catch (err) {
         log.error(`broadcast serialization failed for event ${event}: ${formatErrorMessage(err)}`);
         return;

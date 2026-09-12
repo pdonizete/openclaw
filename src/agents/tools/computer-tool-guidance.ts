@@ -126,8 +126,12 @@ export function buildComputerToolDescription(
     hasImageObservation &&
     capabilities.targets.includes("screen") &&
     hasPixelAction;
-  const hasBackground = capabilities.deliveryModes.includes("background") && hasDeliveryAction;
-  const hasForeground = capabilities.deliveryModes.includes("foreground") && hasDeliveryAction;
+  const hasWindowDelivery =
+    hasWindowState && (capabilities.targets.includes("window") || hasElementTarget);
+  const hasBackground =
+    hasWindowDelivery && capabilities.deliveryModes.includes("background") && hasDeliveryAction;
+  const hasForeground =
+    hasWindowDelivery && capabilities.deliveryModes.includes("foreground") && hasDeliveryAction;
   const targetOrder = [
     ...(hasElementTarget ? ["elementRef from the latest observation"] : []),
     ...(hasWindowPixelTarget ? ["window coordinates from the latest observation"] : []),
@@ -139,6 +143,9 @@ export function buildComputerToolDescription(
     advertisesAction(capabilities, "screenshot")
       ? "`screenshot` and `wait` capture the desktop and return frameId; they do not accept window or browser targets."
       : "",
+    hasWindowState && advertisesAction(capabilities, "list_windows")
+      ? "Use `list_windows` to obtain windowRef."
+      : "",
     hasWindowState && hasImageObservation && hasAccessibilityObservation
       ? "Observe first with `get_window_state` using windowRef: it returns the window image, accessibility, and observationId for window input; ground the target on both image and accessibility."
       : hasWindowState
@@ -147,14 +154,24 @@ export function buildComputerToolDescription(
             ...(hasAccessibilityObservation ? ["accessibility"] : []),
           ].join(" and ")} data.`
         : "",
+    hasWindowState &&
+    hasAccessibilityObservation &&
+    advertisesAction(capabilities, "get_accessibility_tree")
+      ? "Use `get_accessibility_tree` for unfiltered desktop discovery. For a window subtree or `query`, `depth`, and `maxElements` filters, use `get_window_state` with `windowRef`."
+      : "",
     targetOrder.length > 0 ? `Target order: ${targetOrder.join(" > ")}.` : "",
     hasWindowPixelTarget
       ? "Window inputs follow `details.coordinateSpace`: `image-pixels` uses the delivered image; accessibility bounds retain provider-native units."
       : "",
     hasBackground && hasForeground
-      ? 'Use `deliveryMode:"background"` first. Escalate to foreground only after that attempt reports ineffective or refused.'
+      ? 'For window input, use `deliveryMode:"background"` first. Escalate to foreground only after that attempt reports ineffective or refused.'
       : hasBackground
-        ? 'Use the advertised `deliveryMode:"background"` path.'
+        ? 'For window input, use the advertised `deliveryMode:"background"` path.'
+        : "",
+    advertisesAction(capabilities, "hold_key")
+      ? "Use `hold_key` for a bounded keyboard hold when sustained input is needed."
+      : advertisesAction(capabilities, "key")
+        ? "This node supports key taps only; sustained keyboard input is unavailable."
         : "",
     hasMutation
       ? 'Result precedence is `effect:"confirmed"` > `unverifiable` > `suspected_noop`; action evidence alone does not prove the user\'s goal. Re-observe before another mutation, and never blind-retry a mutation.'

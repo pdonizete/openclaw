@@ -1,4 +1,3 @@
-// Commit helpers that move transient plugin install records into the persisted install index.
 import fs from "node:fs";
 import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
@@ -62,21 +61,6 @@ export function hasPendingPluginInstallRecords(config: OpenClawConfig): boolean 
   return Object.keys(config.plugins?.installs ?? {}).length > 0;
 }
 
-function pluginInstallRecordMapsEqual(
-  left: Readonly<Record<string, PluginInstallRecord>>,
-  right: Readonly<Record<string, PluginInstallRecord>>,
-): boolean {
-  const leftEntries = Object.entries(left);
-  return (
-    leftEntries.length === Object.keys(right).length &&
-    leftEntries.every(
-      ([pluginId, record]) =>
-        Object.hasOwn(right, pluginId) &&
-        isDeepStrictEqual(getPluginInstallRecordMapEntry(right, pluginId), record),
-    )
-  );
-}
-
 /** Find pending install records that match the base config and can be stripped as unchanged. */
 export function unchangedPendingPluginInstallRecordIds(
   config: OpenClawConfig,
@@ -120,11 +104,10 @@ export function stripPendingPluginInstallRecords(
   };
 }
 
-type ConfigCommit<T = ConfigReplaceResult | void> = (
+type ConfigCommit<T extends ConfigReplaceResult | void = ConfigReplaceResult | void> = (
   config: OpenClawConfig,
   writeOptions?: ConfigWriteOptions,
 ) => Promise<T>;
-const PLUGIN_SOURCE_CHANGED_RESTART_REASON = "plugin source changed";
 
 function mergeAfterWrite(
   writeOptions: ConfigWriteOptions | undefined,
@@ -493,10 +476,6 @@ async function commitPluginInstallRecordsWithWriter<T extends ConfigReplaceResul
         prepared.nextInstallRecords,
         clearedMarkerSnapshots,
       );
-      const installRecordsChanged = !pluginInstallRecordMapsEqual(
-        prepared.previousInstallRecords,
-        prepared.nextInstallRecords,
-      );
       const writeOptions = copyRuntimeConfigWriteApplication(params.writeOptions, {
         ...params.writeOptions,
         ...(params.beforePersistentEffect
@@ -504,14 +483,6 @@ async function commitPluginInstallRecordsWithWriter<T extends ConfigReplaceResul
               beforeCommit: async () => {
                 await params.writeOptions?.beforeCommit?.();
                 await params.beforePersistentEffect?.();
-              },
-            }
-          : {}),
-        ...(installRecordsChanged && params.writeOptions?.afterWrite === undefined
-          ? {
-              afterWrite: {
-                mode: "restart" as const,
-                reason: PLUGIN_SOURCE_CHANGED_RESTART_REASON,
               },
             }
           : {}),
@@ -563,7 +534,7 @@ export async function commitPluginInstallRecordsWithConfig(params: {
   baseHash?: string;
   writeOptions?: ConfigWriteOptions;
   beforePersistentEffect?: () => void | Promise<void>;
-}): Promise<InstalledPluginIndexWriteReceipt> {
+}): Promise<InstalledPluginIndexWriteReceipt & { configWrite: ConfigReplaceResult }> {
   const result = await commitPluginInstallRecordsWithWriter({
     prepareInstallRecords: async (storeOptions) => ({
       previousInstallRecords:
@@ -582,7 +553,7 @@ export async function commitPluginInstallRecordsWithConfig(params: {
       });
     },
   });
-  return result.indexWrite;
+  return { ...result.indexWrite, configWrite: result.committed };
 }
 
 /** Persist plugin install records without rewriting the user-authored config file. */
@@ -715,15 +686,11 @@ export async function transformConfigWithPendingPluginInstalls<T = void>(
         });
       },
     });
-    const afterWrite = resolveConfigWriteAfterWrite(
-      requestedAfterWrite ??
-        (committed.movedInstallRecords
-          ? { mode: "restart", reason: PLUGIN_SOURCE_CHANGED_RESTART_REASON }
-          : undefined),
-    );
+    const afterWrite = resolveConfigWriteAfterWrite(requestedAfterWrite);
     return {
       config: committed.nextConfig,
       persistedHash: committed.persistedHash,
+      persistedSourceConfig: committed.persistedSourceConfig,
       afterWrite,
     };
   };

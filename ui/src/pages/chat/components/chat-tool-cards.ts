@@ -34,6 +34,7 @@ import {
   toolWorkspacePath,
   type ToolRenderOptions,
 } from "./chat-tool-content.ts";
+import { renderToolFailures } from "./chat-tool-failure.ts";
 import { renderToolPreview } from "./widget-card.ts";
 
 export {
@@ -467,6 +468,7 @@ export function renderToolCard(
         opts.onOpenWorkspaceFile,
       )}</span
     >
+    ${expanded ? nothing : renderToolFailures([card], false)}
     <span class="chat-tool-row__chevron" aria-hidden="true">${icons.chevronRight}</span>
   `;
 

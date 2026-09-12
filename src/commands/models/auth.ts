@@ -30,11 +30,6 @@ import { resolveDefaultAgentWorkspaceDir } from "../../agents/workspace.js";
 import { formatCliCommand } from "../../cli/command-format.js";
 import { parseDurationMs } from "../../cli/parse-duration.js";
 import { logConfigUpdated } from "../../config/logging.js";
-import {
-  applyMergePatch,
-  createMergePatch,
-  mergePatchConflicts,
-} from "../../config/merge-patch.js";
 import { normalizeAgentModelRefForConfig } from "../../config/model-input.js";
 import type { ConfigFileSnapshot, OpenClawConfig } from "../../config/types.openclaw.js";
 import {
@@ -44,6 +39,10 @@ import {
   restorePriorAgentsDefaultsModelUnlessOptIn,
   resolveProviderMatch,
 } from "../../plugins/provider-auth-choice-helpers.js";
+import {
+  createProviderAuthConfigPatch,
+  writeProviderAuthConfig,
+} from "../../plugins/provider-auth-config.js";
 import { applyAuthProfileConfig } from "../../plugins/provider-auth-helpers.js";
 import { runProviderPluginAuthMethodUnpersisted } from "../../plugins/provider-auth-method.js";
 import { persistProviderAuthProfilesAfterLogin } from "../../plugins/provider-auth-persistence.js";
@@ -393,6 +392,27 @@ async function pickProviderTokenMethod(params: {
     .then((id) => tokenMethods.find((method) => method.id === id) ?? null);
 }
 
+async function refreshProviderAuthAfterLogin(
+  params: Pick<
+    ModelsAuthLoginFlowOptions,
+    "refreshAfterLogin" | "runtime" | "signal" | "assertCurrent"
+  > & {
+    agentId: string;
+  },
+): Promise<ModelAuthRefreshOutcome> {
+  if (!params.refreshAfterLogin) {
+    return refreshRunningGatewayAuthState(params.agentId, "login", params.runtime);
+  }
+  try {
+    await params.refreshAfterLogin(params.agentId);
+    return "refreshed";
+  } catch {
+    params.signal?.throwIfAborted();
+    params.assertCurrent?.();
+    return "gateway-rejected";
+  }
+}
+
 async function persistProviderAuthResult(params: {
   result: ProviderAuthResult;
   profiles?: ProviderAuthResult["profiles"];
@@ -406,6 +426,7 @@ async function persistProviderAuthResult(params: {
   env?: NodeJS.ProcessEnv;
   beforePersistentEffect?: () => void | Promise<void>;
   assertCurrent?: () => void;
+  signal?: AbortSignal;
   refreshAfterLogin?: ModelsAuthLoginFlowOptions["refreshAfterLogin"];
 }): Promise<{ profiles: ProviderAuthResult["profiles"]; authRefresh: ModelAuthRefreshOutcome }> {
   const defaultModel = params.result.defaultModel
@@ -413,13 +434,10 @@ async function persistProviderAuthResult(params: {
     : undefined;
   const profiles = params.profiles ?? params.result.profiles;
   const persistedProfiles: ProviderAuthResult["profiles"] = [];
-  const patchOptions = { mergeObjectArraysById: true };
   // Match source and runtime rows using the config owner's canonical model identities.
   const loginConfig = applyProviderAuthConfigPatch(params.config, {});
-  const sourceConfig = applyProviderAuthConfigPatch(params.configSnapshot.sourceConfig, {});
-  const runtimeConfig = applyProviderAuthConfigPatch(params.configSnapshot.runtimeConfig, {});
   const configPatch = params.result.configPatch
-    ? createMergePatch(
+    ? createProviderAuthConfigPatch(
         loginConfig,
         restorePriorAgentsDefaultsModelUnlessOptIn({
           cfg: applyProviderAuthConfigPatch(
@@ -434,7 +452,6 @@ async function persistProviderAuthResult(params: {
           priorAgentsDefaultsModel: loginConfig.agents?.defaults?.model,
           setDefault: params.setDefault,
         }),
-        patchOptions,
       )
     : undefined;
   const shouldUpdateConfig =
@@ -467,44 +484,26 @@ async function persistProviderAuthResult(params: {
 
     // Replay only the login's changes; the writer may have newer unrelated settings.
     if (shouldUpdateConfig) {
-      const updated = await updateConfig(
-        (cfg) => {
-          params.assertCurrent?.();
+      const updated = await writeProviderAuthConfig({
+        config: params.config,
+        configSnapshot: params.configSnapshot,
+        configPatch,
+        credentialsSaved: persistedProfiles.length > 0,
+        beforeCommit: params.assertCurrent,
+        finalizeConfig: (replayed, cfg) => {
           const priorAgentsDefaultsModel = cfg.agents?.defaults?.model;
-          let next = applyProviderAuthConfigPatch(cfg, {});
-          if (configPatch) {
-            if (
-              (mergePatchConflicts(loginConfig, runtimeConfig, configPatch, patchOptions) &&
-                mergePatchConflicts(loginConfig, sourceConfig, configPatch, patchOptions)) ||
-              mergePatchConflicts(sourceConfig, next, configPatch, patchOptions)
-            ) {
-              throw new Error(
-                "Provider settings changed during sign-in. Review the current settings and retry.",
-              );
-            }
-            // SAFETY: The patch derives from typed config; updateConfig validates the merged value before writing.
-            next = applyMergePatch(next, configPatch, patchOptions) as OpenClawConfig;
-          }
-          next = restorePriorAgentsDefaultsModelUnlessOptIn({
-            cfg: next,
+          const next = restorePriorAgentsDefaultsModelUnlessOptIn({
+            cfg: replayed,
             priorAgentsDefaultsModel,
             setDefault: params.setDefault,
           });
           if (params.setDefault && defaultModel) {
-            next =
-              profiles.length > 0
-                ? applyProviderLoginDefaultModel(next, defaultModel)
-                : applyDefaultModel(next, defaultModel);
+            return profiles.length > 0
+              ? applyProviderLoginDefaultModel(next, defaultModel)
+              : applyDefaultModel(next, defaultModel);
           }
           return next;
         },
-        undefined,
-        params.assertCurrent,
-      ).catch((error: unknown) => {
-        if (persistedProfiles.length === 0) {
-          throw error;
-        }
-        throw new ProviderAuthConfigApplyError(error);
       });
       if (defaultModel) {
         const repaired = await repairCodexRuntimePluginInstallForModelSelection({
@@ -522,13 +521,7 @@ async function persistProviderAuthResult(params: {
       logConfigUpdated(params.runtime);
     }
 
-    let authRefresh: ModelAuthRefreshOutcome;
-    if (params.refreshAfterLogin) {
-      await params.refreshAfterLogin(params.agentId);
-      authRefresh = "refreshed";
-    } else {
-      authRefresh = await refreshRunningGatewayAuthState(params.agentId, "login", params.runtime);
-    }
+    const authRefresh = await refreshProviderAuthAfterLogin(params);
 
     for (const profile of persistedProfiles) {
       params.runtime.log(
@@ -682,6 +675,7 @@ async function runProviderAuthMethod(params: {
     result: connectionResult,
     profiles,
     assertCurrent: params.assertCurrent,
+    signal: params.signal,
     config: params.config,
     configSnapshot: params.configSnapshot,
     agentId: params.agentId,
@@ -1061,7 +1055,7 @@ function credentialMode(credential: AuthProfileCredential): "api_key" | "oauth" 
 }
 
 /** Applies an optional profile-id override to a single returned login profile. */
-export function resolveLoginProfiles(params: {
+function resolveLoginProfiles(params: {
   result: ProviderAuthResult;
   requestedProfileId?: string;
 }): ProviderAuthResult["profiles"] {
@@ -1204,13 +1198,7 @@ export async function runModelsAuthLoginFlowCore(
       provider: imported.provider,
       profileId: imported.profileId,
     });
-    let authRefresh: ModelAuthRefreshOutcome;
-    if (opts.refreshAfterLogin) {
-      await opts.refreshAfterLogin(context.agentId);
-      authRefresh = "refreshed";
-    } else {
-      authRefresh = await refreshRunningGatewayAuthState(context.agentId, "login", opts.runtime);
-    }
+    const authRefresh = await refreshProviderAuthAfterLogin({ ...opts, agentId: context.agentId });
     if (imported.configUpdated) {
       logConfigUpdated(opts.runtime);
     }

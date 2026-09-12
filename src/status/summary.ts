@@ -48,10 +48,12 @@ import {
 } from "../tasks/task-registry.audit.js";
 import { deliveryContextFromSession } from "../utils/delivery-context.shared.js";
 import { resolveRuntimeServiceVersion } from "../version.js";
-import { readStatusSessionStores } from "./session-stores.js";
+import {
+  readStatusSessionStores,
+  STATUS_RECENT_SESSION_LIMIT,
+  type StatusSessionStores,
+} from "./session-stores.js";
 import type { HeartbeatStatus, SessionStatus, StatusSummary } from "./types.js";
-
-const RECENT_SESSION_LIMIT = 10;
 
 const channelSummaryModuleLoader = createLazyImportLoader(
   () => import("../infra/channel-summary.js"),
@@ -231,7 +233,7 @@ async function prepareSessionStatusDetails(cfg: OpenClawConfig, now: number) {
         });
         const configuredSessionModel = configuredForSession.model ?? DEFAULT_MODEL;
         const configuredSessionModelLabel = `${configuredForSession.provider ?? DEFAULT_PROVIDER}/${configuredSessionModel}`;
-        const resolvedModel = resolveSessionModelRef(cfg, entry, agentId);
+        const resolvedModel = resolveSessionModelRef(configuredForSession, entry);
         const model = resolvedModel.model ?? configuredSessionModel ?? null;
         const lookupModel =
           resolveStatusModelLookupRef({
@@ -370,6 +372,7 @@ export async function getStatusSummary(
     config?: OpenClawConfig;
     sourceConfig?: OpenClawConfig;
     hostDesktopStatus?: import("../gateway/desktop/host-source.js").HostDesktopStatus;
+    sessionStores?: StatusSessionStores;
   } = {},
 ): Promise<StatusSummary> {
   const { includeSensitive = true, includeChannelSummary = true } = options;
@@ -404,7 +407,11 @@ export async function getStatusSummary(
     return agentList.agents.map((agent, index) => {
       const summary = expectDefined(heartbeatSummaries[index], "heartbeat summary");
       let waitingForRoute = false;
-      if (summary.enabled && (summary.target === "last" || summary.target === "owner")) {
+      if (
+        summary.enabled &&
+        !agent.admissionRefusal &&
+        (summary.target === "last" || summary.target === "owner")
+      ) {
         const heartbeatSession = resolveHeartbeatSessionKey(
           cfg,
           agent.id,
@@ -434,7 +441,7 @@ export async function getStatusSummary(
       }
       return {
         agentId: agent.id,
-        enabled: summary.enabled,
+        enabled: summary.enabled && !agent.admissionRefusal,
         every: summary.every,
         everyMs: summary.everyMs,
         waitingForRoute,
@@ -484,14 +491,20 @@ export async function getStatusSummary(
 
   const sessionDetails = includeSensitive ? await prepareSessionStatusDetails(cfg, now) : undefined;
 
-  const sessionStores = readStatusSessionStores(
-    cfg,
-    agentList.agents,
-    includeSensitive ? RECENT_SESSION_LIMIT : 0,
-  );
+  const sessionStores =
+    options.sessionStores ??
+    readStatusSessionStores(
+      cfg,
+      agentList.agents,
+      includeSensitive ? STATUS_RECENT_SESSION_LIMIT : 0,
+    );
   const byAgent = await Promise.all(
     sessionStores.byAgent.map(async ({ agent, path, count, recent }) => ({
       agentId: agent.id,
+      ...(agent.status ? { status: agent.status } : {}),
+      ...(includeSensitive && agent.admissionRefusal
+        ? { admissionRefusal: agent.admissionRefusal }
+        : {}),
       path: includeSensitive ? path : "[redacted]",
       count,
       recent: sessionDetails ? await sessionDetails.buildSessionRows(recent) : [],
@@ -501,7 +514,7 @@ export async function getStatusSummary(
     ? await sessionDetails.buildSessionRows(
         sortAndLimitBy(
           sessionStores.recent,
-          RECENT_SESSION_LIMIT,
+          STATUS_RECENT_SESSION_LIMIT,
           compareSessionCandidatesByUpdatedAt,
         ),
       )

@@ -50,6 +50,7 @@ import {
   writeSessionIngestionState,
 } from "./session-ingestion.js";
 import { commitMemoryContent, hashMemoryContent } from "./short-term-promotion-memory-write.js";
+import { readPhaseSignalStore, writePhaseSignalStore } from "./short-term-promotion-store.js";
 import type { ShortTermRecallEntry } from "./short-term-promotion-types.js";
 
 type ForgetDatabase = {
@@ -242,8 +243,11 @@ async function planMemoryIndex(params: {
         chunkIds.length > 0 && tableExists(db, "memory_index_chunks_fts")
           ? executeSqliteQuerySync(
               db,
-              kysely.selectFrom("memory_index_chunks_fts").select("id").where("id", "in", chunkIds),
-            ).rows.length
+              kysely
+                .selectFrom("memory_index_chunks_fts")
+                .select((eb) => eb.fn.countAll<number>().as("count"))
+                .where("id", "in", chunkIds),
+            ).rows[0]!.count
           : 0;
       const hasVectorTable = tableExists(db, "memory_index_chunks_vec");
       let embeddingCacheRows = 0;
@@ -294,13 +298,13 @@ async function planMemoryIndex(params: {
           db,
           vectorKysely
             .selectFrom("memory_index_chunks_vec")
-            .select("id")
+            .select((eb) => eb.fn.countAll<number>().as("count"))
             .where(
               "id",
               "in",
               result.value.chunks.map((chunk) => chunk.id),
             ),
-        ).rows.length;
+        ).rows[0]!.count;
       },
       { agentId: params.agentId },
       { allowExtension: true },
@@ -443,17 +447,25 @@ async function forgetWorkspaceMemory(
     }
   }
 
-  const [shortTermEntries, ingestionState, backups, artifactProvenance, sessionCorpusEntries] =
-    await Promise.all([
-      readMemoryCoreWorkspaceEntries<ShortTermRecallEntry>({
-        namespace: SHORT_TERM_RECALL_NAMESPACE,
-        workspaceDir,
-      }),
-      readSessionIngestionState(workspaceDir),
-      readMemoryPreimages(workspaceDir),
-      listMemoryArtifactProvenance({ workspaceDir }),
-      listSessionTranscriptCorpusEntriesForAgent(params.agentId),
-    ]);
+  const nowIso = new Date().toISOString();
+  const [
+    shortTermEntries,
+    phaseSignals,
+    ingestionState,
+    backups,
+    artifactProvenance,
+    sessionCorpusEntries,
+  ] = await Promise.all([
+    readMemoryCoreWorkspaceEntries<ShortTermRecallEntry>({
+      namespace: SHORT_TERM_RECALL_NAMESPACE,
+      workspaceDir,
+    }),
+    readPhaseSignalStore(workspaceDir, nowIso),
+    readSessionIngestionState(workspaceDir),
+    readMemoryPreimages(workspaceDir),
+    listMemoryArtifactProvenance({ workspaceDir }),
+    listSessionTranscriptCorpusEntriesForAgent(params.agentId),
+  ]);
   const sessionKeys = new Set(targets.map((target) => target.sessionKey));
   const curatedWrites = new Map(
     artifactProvenance
@@ -472,6 +484,15 @@ async function forgetWorkspaceMemory(
       !entryKeys.has(key) &&
       !entryKeys.has(value.key) &&
       !referencesSession(`${value.path}\n${value.snippet}`, params.agentId, sessionIds),
+  );
+  const retainedShortTermSet = new Set(retainedShortTerm);
+  const removedShortTermKeys = new Set(
+    shortTermEntries
+      .filter((entry) => !retainedShortTermSet.has(entry))
+      .flatMap(({ key, value }) => [key, value.key]),
+  );
+  const removedPhaseSignalKeys = Object.keys(phaseSignals.entries).filter(
+    (key) => entryKeys.has(key) || removedShortTermKeys.has(key),
   );
   const retainedSeenMessages = Object.entries(ingestionState.seenMessages).filter(
     ([scope]) => !referencesSession(scope, params.agentId, sessionIds),
@@ -657,6 +678,15 @@ async function forgetWorkspaceMemory(
         executeSqliteQuerySync(db, kysely.deleteFrom("memory_embedding_cache"));
       }
     });
+    if (removedPhaseSignalKeys.length > 0) {
+      for (const key of removedPhaseSignalKeys) {
+        delete phaseSignals.entries[key];
+      }
+      phaseSignals.updatedAt = nowIso;
+      // Phase signals are derived from recall rows. Remove them first so a
+      // later failure leaves the authoritative recall evidence for a retry.
+      await writePhaseSignalStore(workspaceDir, phaseSignals);
+    }
     if (retainedShortTerm.length !== shortTermEntries.length) {
       await writeMemoryCoreWorkspaceEntries({
         namespace: SHORT_TERM_RECALL_NAMESPACE,

@@ -6,6 +6,7 @@ import {
 } from "./agent-run-control-shared.js";
 import type {
   RealtimeVoiceBridge,
+  RealtimeVoiceAgentConsultRunner,
   RealtimeVoiceBridgeCallbacks,
   RealtimeVoiceAudioClearReason,
   RealtimeVoiceAudioFormat,
@@ -43,7 +44,7 @@ export type RealtimeVoiceMarkStrategy = "transport" | "ack-immediately" | "ignor
 export type RealtimeVoiceBridgeSession = {
   bridge: RealtimeVoiceBridge;
   acknowledgeMark(markName?: string): void;
-  close(options?: RealtimeVoiceCloseOptions): void;
+  close(options?: RealtimeVoiceCloseOptions): void | Promise<void>;
   connect(): Promise<void>;
   sendAudio(audio: Buffer): void;
   sendUserMessage(text: string): void;
@@ -76,6 +77,7 @@ export type RealtimeVoiceBridgeSessionParams = {
   markStrategy?: RealtimeVoiceMarkStrategy;
   triggerGreetingOnReady?: boolean;
   tools?: RealtimeVoiceTool[];
+  runAgentConsult?: RealtimeVoiceAgentConsultRunner;
   onTranscript?: (role: RealtimeVoiceRole, text: string, isFinal: boolean) => void;
   handleDelegationInput?: RealtimeVoiceBridgeCallbacks["handleDelegationInput"];
   onEvent?: (event: RealtimeVoiceBridgeEvent) => void;
@@ -91,7 +93,7 @@ export type RealtimeVoiceBridgeSessionParams = {
   onClose?: (reason: RealtimeVoiceCloseReason) => void;
 };
 
-type RealtimeVoiceSessionPhase = "admitting" | "provider-terminal" | "disposed";
+type RealtimeVoiceSessionPhase = "admitting" | "provider-terminal" | "closing" | "disposed";
 
 /**
  * Creates a realtime voice bridge session and wires provider events to the configured audio sink.
@@ -101,12 +103,14 @@ export function createRealtimeVoiceBridgeSession(
 ): RealtimeVoiceBridgeSession {
   const bridgeRef: { current?: RealtimeVoiceBridge } = {};
   const handleDelegationInput = params.handleDelegationInput;
+  const runAgentConsult = params.runAgentConsult;
   const getPlaybackState = params.audioSink.getPlaybackState;
   // Local disposal owns provider cleanup. Only a terminal callback fired before bridge
   // adoption may reopen; adopted bridges own reconnects and stale-event fencing internally.
   let phase: RealtimeVoiceSessionPhase = "admitting";
   let terminalBeforeBridgeAdoption = false;
   let closeReported = false;
+  let closeCompletion: Promise<void> | undefined;
   const isAdmitting = () => phase === "admitting";
   const requireBridge = () => {
     if (!bridgeRef.current) {
@@ -130,17 +134,33 @@ export function createRealtimeVoiceBridgeSession(
     get bridge() {
       return requireBridge();
     },
-    acknowledgeMark: (markName) => requireBridge().acknowledgeMark(markName),
-    close: (options) => {
-      if (phase === "disposed") {
-        return;
+    acknowledgeMark: (markName) => {
+      if (isAdmitting()) {
+        requireBridge().acknowledgeMark(markName);
+      }
+    },
+    close: (options): void | Promise<void> => {
+      if (phase === "closing" || phase === "disposed") {
+        return closeCompletion;
       }
       const bridge = requireBridge();
+      phase = "closing";
+      try {
+        const completion = bridge.close(options);
+        if (completion) {
+          closeCompletion = completion.finally(() => {
+            phase = "disposed";
+          });
+          return closeCompletion;
+        }
+      } catch (error) {
+        phase = "disposed";
+        throw error;
+      }
       phase = "disposed";
-      bridge.close(options);
     },
     connect: () => {
-      if (phase === "disposed") {
+      if (phase === "closing" || phase === "disposed") {
         return Promise.reject(new Error("Realtime voice session is closed"));
       }
       if (phase === "provider-terminal") {
@@ -164,9 +184,20 @@ export function createRealtimeVoiceBridgeSession(
         requestResponse(bridge.sendUserMessage?.bind(bridge, text));
       }
     },
-    handleBargeIn: (options) => requireBridge().handleBargeIn?.(options),
-    setMediaTimestamp: (ts) => requireBridge().setMediaTimestamp(ts),
+    handleBargeIn: (options) => {
+      if (isAdmitting()) {
+        requireBridge().handleBargeIn?.(options);
+      }
+    },
+    setMediaTimestamp: (ts) => {
+      if (isAdmitting()) {
+        requireBridge().setMediaTimestamp(ts);
+      }
+    },
     submitToolResult: (callId, result, options) => {
+      if (!isAdmitting()) {
+        return;
+      }
       const bridge = requireBridge();
       if (options?.suppressResponse && bridge.supportsToolResultSuppression === false) {
         throw new Error("Realtime provider does not support suppressed tool results");
@@ -203,6 +234,22 @@ export function createRealtimeVoiceBridgeSession(
     autoRespondToAudio: params.autoRespondToAudio,
     interruptResponseOnInputAudio: params.interruptResponseOnInputAudio,
     tools: params.tools,
+    ...(runAgentConsult
+      ? {
+          runAgentConsult: async (request) => {
+            if (!isAdmitting()) {
+              throw new Error("Realtime voice session is closed");
+            }
+            request.signal?.throwIfAborted();
+            const result = await runAgentConsult(request);
+            request.signal?.throwIfAborted();
+            if (!isAdmitting()) {
+              throw new Error("Realtime voice session is closed");
+            }
+            return result;
+          },
+        }
+      : {}),
     onAudio: (audio, metadata) => {
       if (canSendAudio()) {
         params.audioSink.sendAudio(audio, metadata);
@@ -250,7 +297,11 @@ export function createRealtimeVoiceBridgeSession(
         }
       }
     },
-    onTranscript: params.onTranscript,
+    onTranscript: (role, text, isFinal) => {
+      if (isAdmitting() || (phase === "closing" && isFinal)) {
+        params.onTranscript?.(role, text, isFinal);
+      }
+    },
     ...(handleDelegationInput
       ? {
           handleDelegationInput: (text, respond) => {
@@ -313,7 +364,7 @@ export function createRealtimeVoiceBridgeSession(
       if (!bridgeRef.current) {
         terminalBeforeBridgeAdoption = true;
       }
-      if (phase !== "disposed") {
+      if (phase !== "closing" && phase !== "disposed") {
         phase = "provider-terminal";
       }
       if (closeReported) {

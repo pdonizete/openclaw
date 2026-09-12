@@ -4,11 +4,13 @@ import path from "node:path";
 import { asNullableRecord } from "@openclaw/normalization-core/record-coerce";
 import { err as resultError, ok, type Result } from "@openclaw/normalization-core/result";
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
+import { minVersion, validRange, valid } from "semver";
 import { detectCurrentSqliteCapabilities, nodeRuntimeFailure } from "../../../node-sqlite.mjs";
 import { createConfigIO } from "../../config/io.js";
 import { resolveGatewayPort } from "../../config/paths.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { resolveNodeRuntimeInfo } from "../../daemon/runtime-paths.js";
+import type { ServiceInspectionReason } from "../../daemon/service-inspection-error.js";
 import { summarizeGatewayServiceLayout } from "../../daemon/service-layout.js";
 import type { GatewayServiceCommandConfig } from "../../daemon/service-types.js";
 import { resolveGatewayService } from "../../daemon/service.js";
@@ -16,6 +18,11 @@ import { assertGatewayServiceMutationAllowed } from "../../infra/gateway-supervi
 import { tryReadJson } from "../../infra/json-files.js";
 import { nodeVersionSatisfiesEngine } from "../../infra/runtime-guard.js";
 import { parseTcpPortFromArgs } from "../../infra/tcp-port.js";
+import {
+  createUpdateFailureFact,
+  type UpdateFailureFact,
+} from "../../infra/update-failure-facts.js";
+import { CLI_NAME } from "../cli-name.js";
 import { resolveNodeRunner } from "./shared.js";
 
 export type ManagedServiceRootRedirect = {
@@ -33,12 +40,35 @@ export type ManagedGatewayUpdateVerdict =
       requiresInstallRootRefresh?: boolean;
     }
   | { kind: "unresolved"; root: string; fingerprint: string }
-  | { kind: "unavailable"; message: string };
+  | { kind: "unavailable"; message: string; inspectionReason?: ServiceInspectionReason };
+
+export function collectServiceInspectionFailureFacts(
+  verdict: ManagedGatewayUpdateVerdict | undefined,
+): UpdateFailureFact[] | undefined {
+  return verdict?.kind === "unavailable"
+    ? [
+        createUpdateFailureFact({
+          check: "managed-service",
+          code: verdict.inspectionReason ?? "service-inspection-unavailable",
+          message: verdict.message,
+        }),
+      ]
+    : undefined;
+}
 
 export class GatewayServiceUpdateOwnershipError extends Error {
-  constructor(message: string, cause: unknown) {
+  readonly failureFacts: UpdateFailureFact[];
+
+  constructor(message: string, cause: unknown, inspectionReason?: ServiceInspectionReason) {
     super(message, { cause });
     this.name = "GatewayServiceUpdateOwnershipError";
+    this.failureFacts = [
+      createUpdateFailureFact({
+        check: "managed-service",
+        code: inspectionReason ?? "service-ownership-unverified",
+        message,
+      }),
+    ];
   }
 }
 
@@ -51,6 +81,9 @@ export function assertGatewayServiceAdmissionUnchanged(
     throw new GatewayServiceUpdateOwnershipError(
       "Gateway service ownership changed after database admission; run `openclaw gateway status --deep` and retry.",
       undefined,
+      serviceUpdateVerdict.kind === "unavailable"
+        ? serviceUpdateVerdict.inspectionReason
+        : undefined,
     );
   }
   if (
@@ -107,7 +140,7 @@ export async function resolvePackageRuntimePreflight(params: {
   timeoutMs?: number;
   nodeRunner?: string;
   fallbackNodeRunner?: string;
-}): Promise<Result<PackageRuntimePreflight, string>> {
+}): Promise<Result<PackageRuntimePreflight, string> & { failureFacts?: UpdateFailureFact[] }> {
   const nodeRunner = normalizeOptionalString(params.nodeRunner);
   const unchanged = (): PackageRuntimePreflight => (nodeRunner ? { nodeRunner } : {});
   let target = params.target;
@@ -166,18 +199,30 @@ export async function resolvePackageRuntimePreflight(params: {
   const runtimeLabel = runtime.nodeRunner
     ? `Node ${runtime.version ?? "unknown"} at ${runtime.nodeRunner}`
     : `Node ${runtime.version ?? "unknown"}`;
-  return resultError(
-    [
-      `${runtimeLabel} is incompatible with openclaw@${targetVersion}.`,
-      ...(runtime.failure ? [runtime.failure] : []),
-      `The requested package requires ${target.nodeEngine}.`,
-      runtime.nodeRunner
-        ? "Use a compatible version of the Node runtime that owns the managed Gateway service, then rerun `openclaw update`."
-        : "Use a Node runtime that satisfies the engine range above, then rerun `openclaw update`.",
-      "Bare `npm i -g openclaw` can silently install an older compatible release.",
-      "After switching Node versions, use `npm i -g openclaw@latest`.",
-    ].join("\n"),
-  );
+  const engineRange = target.nodeEngine ? validRange(target.nodeEngine) : null;
+  const minimum = engineRange ? (minVersion(engineRange)?.version ?? "unspecified") : "unspecified";
+  return {
+    ...resultError<PackageRuntimePreflight, string>(
+      [
+        `${runtimeLabel} is incompatible with openclaw@${targetVersion}.`,
+        ...(runtime.failure ? [runtime.failure] : []),
+        `The requested package requires ${target.nodeEngine}.`,
+        runtime.nodeRunner
+          ? "Use a compatible version of the Node runtime that owns the managed Gateway service, then rerun `openclaw update`."
+          : "Use a Node runtime that satisfies the engine range above, then rerun `openclaw update`.",
+        "Bare `npm i -g openclaw` can silently install an older compatible release.",
+        "After switching Node versions, use `npm i -g openclaw@latest`.",
+      ].join("\n"),
+    ),
+    failureFacts: [
+      createUpdateFailureFact({
+        check: "node-runtime",
+        code: "node-runtime-preflight",
+        affectedKey: "engines.node",
+        message: `Target package: openclaw@${valid(targetVersion) ?? "unknown"}; Minimum Node engine: ${minimum}; Running Node: ${valid(runtime.version ?? "") ?? "unknown"}`,
+      }),
+    ],
+  };
 }
 
 async function resolvePackageRuntimeForPreflight(params: {
@@ -358,4 +403,44 @@ export async function resolveUpdatedGatewayRestartPort(params: {
     }).readBestEffortConfig();
   }
   return resolveGatewayPort(config, env);
+}
+
+/** Describe the selected plan without changing roots, runtime, or service authority. */
+export function formatManagedServicePackageUpdatePlan(params: {
+  rootRedirect: ManagedServiceRootRedirect | null;
+  nodeRunner?: string;
+}): Array<{ level: "muted" | "warn"; message: string }> {
+  const { rootRedirect, nodeRunner } = params;
+  if (rootRedirect) {
+    return [
+      {
+        level: "muted",
+        message: `Targeting managed gateway service package root: ${rootRedirect.root}`,
+      },
+      {
+        level: "warn",
+        message: `Shell OpenClaw root differs from the managed gateway service root: ${rootRedirect.previousRoot}`,
+      },
+      {
+        level: "muted",
+        message: `After the update, make sure \`${CLI_NAME}\` on PATH resolves to the managed service root or reinstall the gateway service from the shell install you want to use.`,
+      },
+      ...(nodeRunner
+        ? [{ level: "muted" as const, message: `Managed gateway service Node: ${nodeRunner}` }]
+        : []),
+    ];
+  }
+  return nodeRunner
+    ? [
+        {
+          level: "warn",
+          message: `Current Node (${resolveNodeRunner()}) differs from the managed gateway service Node (${nodeRunner}).`,
+        },
+        {
+          level: "muted",
+          message:
+            "Using the managed service Node for this update so the gateway can start after the upgrade.",
+        },
+      ]
+    : [];
 }

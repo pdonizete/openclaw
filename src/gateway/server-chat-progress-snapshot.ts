@@ -103,9 +103,29 @@ export function updateChatRunProgressSnapshot(
     ? next.events.find((candidate) => candidate.stream === "usage")
     : undefined;
 
+  let recounted = false;
   const removeWhere = (predicate: (candidate: AgentEventPayload) => boolean) => {
-    next.events = next.events.filter((candidate) => !predicate(candidate));
-    next.byteLength = next.events.reduce((total, candidate) => total + jsonUtf8Bytes(candidate), 0);
+    let removedBytes = 0;
+    next.events = next.events.filter((candidate) => {
+      if (!predicate(candidate)) {
+        return true;
+      }
+      if (recounted) {
+        removedBytes += jsonUtf8Bytes(candidate);
+      }
+      return false;
+    });
+    if (recounted) {
+      next.byteLength -= removedBytes;
+    } else {
+      // Nested producer payloads can change between updates. Recount once,
+      // then charge only evictions during this synchronous update.
+      next.byteLength = next.events.reduce(
+        (total, candidate) => total + jsonUtf8Bytes(candidate),
+        0,
+      );
+      recounted = true;
+    }
   };
 
   if (
@@ -167,14 +187,21 @@ export function updateChatRunProgressSnapshot(
           phase,
           name: typeof data.name === "string" ? data.name : undefined,
           toolCallId,
-          args: phase === "start" ? data.args : undefined,
-          partialResult: phase === "update" ? data.partialResult : undefined,
-          diff: phase === "input_delta" ? data.diff : undefined,
-          review: phase === "review" ? data.review : undefined,
-          approvalReviewOutcome:
-            phase === "review" || phase === "result" ? data.approvalReviewOutcome : undefined,
-          isError: phase === "result" ? data.isError : undefined,
-          result: phase === "result" ? data.result : undefined,
+          ...(phase === "start"
+            ? { args: data.args }
+            : phase === "update"
+              ? { partialResult: data.partialResult }
+              : phase === "input_delta"
+                ? { diff: data.diff }
+                : phase === "review"
+                  ? { review: data.review, approvalReviewOutcome: data.approvalReviewOutcome }
+                  : phase === "result"
+                    ? {
+                        approvalReviewOutcome: data.approvalReviewOutcome,
+                        isError: data.isError,
+                        result: data.result,
+                      }
+                    : {}),
         }
     : isAssistant
       ? {} // Reconnect needs the progress sequence, not another copy of buffered assistant text.

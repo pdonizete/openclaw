@@ -1,5 +1,7 @@
 // Vitest project config tests validate aggregate Vitest project wiring.
 import { afterEach, describe, expect, it } from "vitest";
+import { resolveExtensionTestConfig } from "../scripts/lib/extension-test-plan.mts";
+import { buildVitestRunPlans } from "../scripts/test-projects.test-support.mts";
 import { spawnNodeEvalSync } from "../src/test-utils/node-process.js";
 import { createPatternFileHelper } from "./helpers/pattern-file.js";
 import { normalizeConfigPath, normalizeConfigPaths } from "./helpers/vitest-config-paths.js";
@@ -30,6 +32,9 @@ import {
   createContractsVitestConfig,
   pluginContractPatterns,
 } from "./vitest/vitest.contracts-shared.ts";
+import { createExtensionDatabaseWorkersVitestConfig } from "./vitest/vitest.extension-database-workers.config.ts";
+import { createExtensionImessageVitestConfig } from "./vitest/vitest.extension-imessage.config.ts";
+import { createExtensionsVitestConfig } from "./vitest/vitest.extensions.config.ts";
 import { createGatewayMethodsIsolatedVitestConfig } from "./vitest/vitest.gateway-methods-isolated.config.ts";
 import { createGatewayMethodsVitestConfig } from "./vitest/vitest.gateway-methods.config.ts";
 import { createGatewayServerIsolatedVitestConfig } from "./vitest/vitest.gateway-server-isolated.config.ts";
@@ -37,6 +42,7 @@ import {
   gatewayMethodsIsolatedTestFiles,
   gatewayServerIsolatedTestFiles,
 } from "./vitest/vitest.gateway-server-paths.mjs";
+import { createGatewayServerVitestConfig } from "./vitest/vitest.gateway-server.config.ts";
 import { createGatewayVitestConfig } from "./vitest/vitest.gateway.config.ts";
 import { createPluginSdkLightVitestConfig } from "./vitest/vitest.plugin-sdk-light.config.ts";
 import {
@@ -57,6 +63,7 @@ const patternFiles = createPatternFileHelper("openclaw-vitest-projects-config-")
 const scopedGatewayMethodsIsolatedTestFiles = [
   "server-methods/agent.test.ts",
   "server-methods/board.runtime-boundaries.test.ts",
+  "server-methods/chat.reset-visible-yield.test.ts",
   "server-methods/system-agent-setup-control-ui.test.ts",
   "server-methods/usage.test.ts",
   "server-methods/usage.sessions-usage.test.ts",
@@ -129,6 +136,7 @@ describe("projects vitest config", () => {
     const methodsConfig = requireTestConfig(createGatewayMethodsVitestConfig({}));
     const methodsIsolatedConfig = requireTestConfig(createGatewayMethodsIsolatedVitestConfig({}));
     const serverIsolatedConfig = requireTestConfig(createGatewayServerIsolatedVitestConfig({}));
+    const serverConfig = requireTestConfig(createGatewayServerVitestConfig({}));
     const gatewayFallback = requireTestConfig(createGatewayVitestConfig());
 
     expect(rootVitestProjects).toContain(methodsIsolatedProject);
@@ -141,15 +149,33 @@ describe("projects vitest config", () => {
     expect(serverIsolatedConfig.isolate).toBe(true);
     expect(serverIsolatedConfig.runner).toBeUndefined();
     expect(serverIsolatedConfig.include).toEqual(gatewayServerIsolatedTestFiles);
-    expect(methodsConfig.exclude).toContain("server-methods/agent.test.ts");
-    expect(methodsConfig.exclude).toContain("server-methods/board.runtime-boundaries.test.ts");
-    expect(methodsConfig.exclude).toContain("server-methods/system-agent-setup-control-ui.test.ts");
-    expect(gatewayFallback.exclude).toContain("server-methods/agent.test.ts");
-    expect(gatewayFallback.exclude).toContain("server-methods/board.runtime-boundaries.test.ts");
-    expect(gatewayFallback.exclude).toContain(
-      "server-methods/system-agent-setup-control-ui.test.ts",
+    const overrideFixture = "src/gateway/server-plugin-subagent-runtime.overrides.test.ts";
+    expect(serverIsolatedConfig.include).toContain(overrideFixture);
+    expect(serverConfig.exclude).toContain("server-plugin-subagent-runtime.overrides.test.ts");
+    expect(gatewayFallback.exclude).toContain(overrideFixture);
+    expect(methodsConfig.exclude).toContain("src/gateway/server-methods/agent.test.ts");
+    expect(methodsConfig.exclude).toContain(
+      "src/gateway/server-methods/board.runtime-boundaries.test.ts",
     );
-    expect(gatewayFallback.exclude).toContain("server.sessions.compaction-read-errors.test.ts");
+    expect(methodsConfig.exclude).toContain(
+      "src/gateway/server-methods/chat.reset-visible-yield.test.ts",
+    );
+    expect(methodsConfig.exclude).toContain(
+      "src/gateway/server-methods/system-agent-setup-control-ui.test.ts",
+    );
+    expect(gatewayFallback.exclude).toContain("src/gateway/server-methods/agent.test.ts");
+    expect(gatewayFallback.exclude).toContain(
+      "src/gateway/server-methods/board.runtime-boundaries.test.ts",
+    );
+    expect(gatewayFallback.exclude).toContain(
+      "src/gateway/server-methods/chat.reset-visible-yield.test.ts",
+    );
+    expect(gatewayFallback.exclude).toContain(
+      "src/gateway/server-methods/system-agent-setup-control-ui.test.ts",
+    );
+    expect(gatewayFallback.exclude).toContain(
+      "src/gateway/server.sessions.compaction-read-errors.test.ts",
+    );
   });
 
   it("limits isolated Gateway include files to each project's owned tests", () => {
@@ -486,6 +512,65 @@ describe("projects vitest config", () => {
     expect(testConfig.fileParallelism).toBe(false);
     expect(testConfig.maxWorkers).toBe(1);
     expect(testConfig.sequence).toMatchObject({ groupOrder: 1 });
+  });
+
+  it.each(["logbook", "team-reports"])(
+    "runs %s database owners in main-thread hosts across focused and full suites",
+    (pluginId) => {
+      const project = "test/vitest/vitest.extension-database-workers.config.ts";
+      const testConfig = requireTestConfig(createExtensionDatabaseWorkersVitestConfig({}));
+      expect(resolveExtensionTestConfig(`extensions/${pluginId}`)).toBe(project);
+      expect(
+        buildVitestRunPlans([`extensions/${pluginId}/src/store.test.ts`]).map(
+          (plan) => plan.config,
+        ),
+      ).toEqual([project]);
+      expect(rootVitestProjects).toContain(project);
+      expect(
+        fullSuiteVitestShards.find((shard) => shard.name === "extensions")?.projects,
+      ).toContain(project);
+      expect(testConfig.pool).toBe("forks");
+      expect(testConfig.isolate).toBe(true);
+      expect(testConfig.include).toEqual([
+        "logbook/**/*.test.ts",
+        "team-reports/**/*.test.ts",
+        "imessage/src/approval-reactions.persistence.test.ts",
+      ]);
+      expect(requireTestConfig(createExtensionsVitestConfig({})).exclude).toContain(
+        `${pluginId}/**`,
+      );
+    },
+  );
+
+  it("routes iMessage persistence through its worker owner without moving sibling tests", () => {
+    const file = "extensions/imessage/src/approval-reactions.persistence.test.ts";
+    const project = "test/vitest/vitest.extension-database-workers.config.ts";
+    const siblingProject = "test/vitest/vitest.extension-imessage.config.ts";
+    for (const target of [
+      file,
+      "extensions/imessage",
+      "extensions/imessage/src/*.test.ts",
+      "extensions/imessage/src/approval-reactions.ts",
+    ]) {
+      const plans = buildVitestRunPlans([target]);
+      expect(plans.find((plan) => plan.config === project)?.includePatterns).toContain(file);
+    }
+    expect(buildVitestRunPlans([file]).map((plan) => plan.config)).toEqual([project]);
+    for (const sibling of ["approval-reactions.test.ts", "approval-reaction-poller.test.ts"]) {
+      expect(
+        buildVitestRunPlans([`extensions/imessage/src/${sibling}`]).map((plan) => plan.config),
+      ).toEqual([siblingProject]);
+    }
+    const workerConfig = requireTestConfig(createExtensionDatabaseWorkersVitestConfig({}));
+    expect(workerConfig.include).toContain("imessage/src/approval-reactions.persistence.test.ts");
+    expect(workerConfig.pool).toBe("forks");
+    expect(workerConfig.isolate).toBe(true);
+    expect(requireTestConfig(createExtensionImessageVitestConfig({})).exclude).toContain(
+      "imessage/src/approval-reactions.persistence.test.ts",
+    );
+    expect(requireTestConfig(createExtensionsVitestConfig({})).exclude).toContain(
+      "imessage/src/approval-reactions.persistence.test.ts",
+    );
   });
 
   it("keeps the bundled lane on thread workers with the non-isolated runner", () => {

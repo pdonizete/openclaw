@@ -17,7 +17,6 @@ import type { RuntimeAuthMaterialization } from "./auth-profiles/runtime-materia
 import type { AuthProfileStore } from "./auth-profiles/types.js";
 import { listCliRuntimeModelBackendBindings } from "./cli-backends.js";
 import { resolveAgentHarnessAvailabilityDecision } from "./harness/availability.js";
-import { createAgentHarnessCatalogEvaluator } from "./harness/model-catalog-readiness.js";
 import { resolveAgentHarnessPolicy } from "./harness/policy.js";
 import { buildAgentHarnessSupportContext, resolveAutoAgentHarnessId } from "./harness/support.js";
 import {
@@ -25,6 +24,7 @@ import {
   type ModelAuthAvailabilityResolver,
   type ModelAuthAvailabilityEvaluation,
 } from "./model-auth-availability.js";
+import { prepareModelCatalogView } from "./model-catalog-view.js";
 import { loadManifestModelCatalog } from "./model-catalog.js";
 import type { ModelCatalogEntry, ModelCatalogSnapshot } from "./model-catalog.types.js";
 import { dedupeModelCatalogEntries } from "./model-selection-shared.js";
@@ -229,7 +229,7 @@ export function createModelCatalogDecisions(params: ModelCatalogDecisionParams) 
         ...loadManifestModelCatalog({ config: params.cfg, metadataSnapshot }),
       ].filter((entry) => personalProviders.has(normalizeProviderId(entry.provider)))
     : [];
-  const snapshot = personalStaticEntries.length
+  let snapshot = personalStaticEntries.length
     ? {
         ...params.snapshot,
         entries: dedupeModelCatalogEntries([...params.snapshot.entries, ...personalStaticEntries]),
@@ -248,18 +248,29 @@ export function createModelCatalogDecisions(params: ModelCatalogDecisionParams) 
       ? (authStore.profiles[selectedProfileId]?.provider ??
         params.cfg.auth?.profiles?.[selectedProfileId]?.provider)
       : undefined);
-  const nativeEvaluator = createAgentHarnessCatalogEvaluator({
-    config: params.cfg,
-    agentId: params.agentId,
-    agentDir: params.agentDir ?? resolveAgentDir(params.cfg, params.agentId),
+  if (
+    snapshot.pendingProviders?.length &&
+    (selectedProfileId || preferredProfilesByProvider.size)
+  ) {
+    const authProvider = (provider: string) =>
+      resolveProviderIdForAuth(provider, { config: params.cfg, metadataSnapshot });
+    // Shared discovery does not describe a selected account's inventory.
+    snapshot = {
+      ...snapshot,
+      pendingProviders: snapshot.pendingProviders.filter(
+        (provider) =>
+          !preferredProfilesByProvider.has(normalizeProviderId(provider)) &&
+          (!selectedProfileId ||
+            (profileProvider && authProvider(provider) !== authProvider(profileProvider))),
+      ),
+    };
+  }
+  const nativeEvaluator = prepareModelCatalogView({
+    ...params,
+    snapshot,
     workspaceDir,
-    preferredProfileId: params.preferredProfileId,
-    pinnedProfileId: params.pinnedProfileId,
     profileProvider,
-    pluginRegistry: params.pluginRegistry,
-    isCurrent: params.isCurrent,
-    observationConfig: params.observationConfig,
-  });
+  }).evaluateNative;
   // A selected profile is host-owned auth, not evidence from the shared native
   // login; the harness evaluator already applies this rule to session pins.
   const evaluateNative: typeof nativeEvaluator = (entry, host, runtimeId) =>

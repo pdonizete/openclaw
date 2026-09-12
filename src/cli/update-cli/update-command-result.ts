@@ -2,6 +2,7 @@
 import { PLUGIN_CAPABILITY_CONSENT_REQUIRED } from "../../../packages/gateway-protocol/src/capability-consent-error-details.js";
 import { theme } from "../../../packages/terminal-core/src/theme.js";
 import type { TriageFailureContext } from "../../commands/triage-prompt.js";
+import { isAbortError } from "../../infra/abort-signal.js";
 import {
   attachErrorDiagnostic,
   formatErrorMessageForDisplay,
@@ -13,23 +14,21 @@ import { isSqliteLockError } from "../../infra/sqlite-error-diagnostics.js";
 import type { readUpdateStateSchemaVersions } from "../../infra/update-candidate-state.js";
 import {
   markControlPlaneUpdateRestartSentinelFailure,
-  resolveManagedServiceUpdateFailureExitCode,
   writeControlPlaneUpdateRestartSentinel,
   type ControlPlaneUpdateSentinelMetaFile,
 } from "../../infra/update-control-plane-sentinel.js";
-import { verifyPackageUpdateRecovery } from "../../infra/update-global.js";
+import type { UpdateFailureFact } from "../../infra/update-failure-facts.js";
+import { UpdateRequesterRevokedError } from "../../infra/update-requester-authority.js";
 import { getUpdateRun, recordUpdateRunPhase } from "../../infra/update-run-ledger.js";
-import { readCurrentGitUpdateRecovery } from "../../infra/update-runner-git-recovery.js";
 import type { UpdateRunResult } from "../../infra/update-runner.js";
 import { defaultRuntime } from "../../runtime.js";
 import type { OpenClawSchemaVersions } from "../../state/openclaw-schema-versions.js";
 import { exitCliAfterOutput } from "../one-shot-exit.js";
 import { printResult } from "./progress.js";
-import type { UpdateCommandOptions } from "./shared.js";
+import { UpdatePreMutationError, type UpdateCommandOptions } from "./shared.js";
 import type { UpdateConfigSnapshot } from "./update-command-config-snapshot.js";
 import type { FinishUpdateParams } from "./update-command-finish-types.js";
 import type { OwnedManagedUpdateContext } from "./update-command-managed-context.js";
-import { completeUpdateCommandRun } from "./update-command-run.js";
 import type { PreManagedServiceStop } from "./update-command-service-context-types.js";
 import { GatewayServiceUpdateOwnershipError } from "./update-command-service-plan.js";
 import { resolveUpdateResultNextAction } from "./update-recovery-guidance.js";
@@ -63,6 +62,47 @@ export type MutableUpdateExecutionResult = {
   activationConfig?: UpdateConfigSnapshot;
 };
 
+export function createUpdateCommandFailureResult(
+  params: Pick<UpdateRunResult, "mode" | "root" | "recovery" | "durationMs"> & {
+    failure: { cause: unknown; detail?: string };
+    admission?: true;
+  },
+): UpdateRunResult {
+  const { failure, admission, ...result } = params;
+  const { cause, detail } = failure;
+  const preMutationFailure = cause instanceof UpdatePreMutationError;
+  const admissionFailure =
+    admission === true && cause instanceof GatewayServiceUpdateOwnershipError;
+  const reason =
+    cause instanceof UpdateRequesterRevokedError
+      ? cause.code
+      : preMutationFailure
+        ? cause.reason
+        : admissionFailure
+          ? "managed-service-preflight"
+          : "update-failed";
+  return {
+    ...result,
+    status: "error",
+    reason,
+    steps: [
+      {
+        name: preMutationFailure || admissionFailure ? reason : "update",
+        command: "openclaw update",
+        cwd: result.root ?? process.cwd(),
+        durationMs: result.durationMs,
+        exitCode: 1,
+        ...(isAbortError(cause) ? { termination: "signal" as const } : {}),
+        ...(detail !== undefined ? { stderrTail: detail } : {}),
+        // Recorded diagnostics do not change post-mutation recovery eligibility.
+        ...(preMutationFailure || cause instanceof GatewayServiceUpdateOwnershipError
+          ? { failureFacts: cause.failureFacts }
+          : {}),
+      },
+    ],
+  };
+}
+
 /** Report rejected read-only admission without creating a run or recovery diagnostics. */
 export async function withUpdateAdmissionReporting<T>(
   opts: UpdateCommandOptions,
@@ -71,6 +111,9 @@ export async function withUpdateAdmissionReporting<T>(
   try {
     return await admit();
   } catch (error) {
+    if (error instanceof UpdateCommandPendingRecoveryFailure) {
+      return reportUpdateCommandPendingRecovery(error, opts);
+    }
     if (!(error instanceof GatewayServiceUpdateOwnershipError)) {
       throw error;
     }
@@ -79,13 +122,12 @@ export async function withUpdateAdmissionReporting<T>(
       defaultRuntime.error(message);
     }
     printResult(
-      {
-        status: "error",
+      createUpdateCommandFailureResult({
         mode: "unknown",
-        reason: "managed-service-preflight",
-        steps: [],
+        admission: true,
+        failure: { cause: error },
         durationMs: 0,
-      },
+      }),
       opts,
       { nextAction: message },
     );
@@ -124,6 +166,20 @@ export class UpdateCommandPendingRecoveryFailure extends UpdateCommandFailure {
     );
     this.name = "UpdateCommandPendingRecoveryFailure";
   }
+}
+
+export function reportUpdateCommandPendingRecovery(
+  error: UpdateCommandPendingRecoveryFailure,
+  opts: Pick<UpdateCommandOptions, "json">,
+): never {
+  // printResult resolves history, which may be part of the retained evidence.
+  if (opts.json) {
+    defaultRuntime.writeJson(error.result);
+  }
+  defaultRuntime.error(
+    `Update recovery remains pending (${error.result.reason ?? "update-failed"}). Retained state and artifacts were left for the owning updater to reconcile; automatic restart and repair were not attempted.${error.detail ? `\n${error.detail}` : ""}`,
+  );
+  return exitCliAfterOutput(defaultRuntime, error.exitCode);
 }
 
 /** Reporting-only marker: the outcome was recorded and printed; no follow-up triage. */
@@ -214,58 +270,31 @@ export function resolveAutomaticUpdateTriage(
     : undefined;
 }
 
-export async function reportPreMutationUpdateFailure(params: {
+export type UpdateAdmissionReportParams = {
+  failureFacts?: readonly UpdateFailureFact[];
   root: string;
   installKind: "git" | "package" | "unknown";
   reason: string;
   message?: string;
   opts: UpdateCommandOptions;
   controlPlaneUpdateSentinelMeta: ControlPlaneUpdateSentinelMetaFile["meta"] | null;
-}): Promise<never> {
-  const run = params.opts.run;
-  const active = run ? getUpdateRun(run.runId, { env: run.env }) : undefined;
-  if (run && active && params.message) {
-    recordUpdateRunPhase(
-      run.runId,
-      active.phase,
-      { origin: { nextAction: params.message } },
-      { env: run.env },
-    );
+};
+
+export type RefuseUpdate = (
+  reason: string,
+  message?: string,
+  failureFacts?: readonly UpdateFailureFact[],
+) => Promise<void>;
+
+/** A fresh admission decision is data until its staging and executor owners settle. */
+export class UnreportedUpdateAdmissionOutcome extends Error {
+  constructor(
+    readonly report: UpdateAdmissionReportParams,
+    readonly skipped?: { exitCode: 0 | 1 },
+  ) {
+    super(report.message ?? report.reason);
+    this.name = "UnreportedUpdateAdmissionOutcome";
   }
-  const result = completeUpdateCommandRun(
-    {
-      status: "error",
-      mode: params.installKind === "git" ? "git" : "unknown",
-      root: params.root,
-      reason: params.reason,
-      ...(params.opts.dryRun !== true
-        ? {
-            recovery: await (params.installKind === "git"
-              ? readCurrentGitUpdateRecovery(params.root)
-              : verifyPackageUpdateRecovery(params.root)),
-          }
-        : {}),
-      steps: [],
-      durationMs: 0,
-    },
-    params.opts.run,
-  );
-  if (params.opts.dryRun !== true) {
-    await writeControlPlaneUpdateRestartSentinelBestEffort({
-      meta: params.controlPlaneUpdateSentinelMeta,
-      result,
-      jsonMode: Boolean(params.opts.json),
-    });
-  }
-  if (params.opts.json && params.message) {
-    defaultRuntime.error(params.message);
-  }
-  printResult(result, params.opts, { nextAction: params.message });
-  throw new UpdateCommandFailure(
-    result,
-    resolveManagedServiceUpdateFailureExitCode(result),
-    params.message,
-  );
 }
 
 export async function writeControlPlaneUpdateRestartSentinelBestEffort(params: {

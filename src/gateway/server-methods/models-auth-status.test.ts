@@ -11,7 +11,6 @@ import {
   type AuthProfileStore,
   type RuntimeAuthProfileStore,
 } from "../../agents/auth-profiles.js";
-import { NON_ENV_SECRETREF_MARKER } from "../../agents/model-auth-markers.js";
 import type { OpenClawConfig } from "../../config/config.js";
 import {
   resetConfigRuntimeState,
@@ -21,6 +20,7 @@ import type { ModelProviderConfig } from "../../config/types.models.js";
 import type { UsageSummary } from "../../infra/provider-usage.types.js";
 import { resolveInstalledPluginIndexPolicyHash } from "../../plugins/installed-plugin-index-policy.js";
 import { createPluginMetadataSnapshotFixture } from "../../plugins/plugin-metadata.test-support.js";
+import { NON_ENV_SECRETREF_MARKER } from "../../secrets/provider-credential-values.js";
 import { resolveProviderAuthLookupMaps } from "../../secrets/provider-env-vars.js";
 import { withEnvAsync } from "../../test-utils/env.js";
 import { createChatRunState } from "../server-chat-state.js";
@@ -57,8 +57,6 @@ const mocks = vi.hoisted(() => ({
   })),
   refreshActiveProviderAuthRuntimeSnapshot: vi.fn(async () => false),
   prepareModelRuntimeSnapshot: vi.fn(async () => {}),
-  clearCurrentProviderAuthState: vi.fn(),
-  warmCurrentProviderAuthStateOffMainThread: vi.fn(async (_cfg: unknown) => {}),
   loadDeferredCatalog: vi.fn(),
   readPreparedCatalog: vi.fn(),
   buildAuthHealthSummary: vi.fn<BuildAuthHealthSummary>((): AuthHealthSummary => ({
@@ -130,11 +128,6 @@ vi.mock("../../secrets/runtime.js", () => ({
 
 vi.mock("../../agents/prepared-model-runtime.js", () => ({
   prepareModelRuntimeSnapshot: mocks.prepareModelRuntimeSnapshot,
-}));
-
-vi.mock("../../agents/model-provider-auth.js", () => ({
-  clearCurrentProviderAuthState: mocks.clearCurrentProviderAuthState,
-  warmCurrentProviderAuthStateOffMainThread: mocks.warmCurrentProviderAuthStateOffMainThread,
 }));
 
 vi.mock("../server-model-catalog-auth.js", () => ({
@@ -354,7 +347,6 @@ function resetAuthStatusMocks(): void {
   mocks.loadProviderUsageSummary.mockResolvedValue(emptyUsageSummary());
   mocks.refreshActiveProviderAuthRuntimeSnapshot.mockResolvedValue(false);
   mocks.prepareModelRuntimeSnapshot.mockResolvedValue();
-  mocks.warmCurrentProviderAuthStateOffMainThread.mockResolvedValue();
 }
 
 function firstDeferredAuthScope() {
@@ -1534,13 +1526,11 @@ describe("models.authStatus", () => {
   it("bypasses cache when params.refresh is set", async () => {
     await handler(createOptions());
     expect(mocks.buildAuthHealthSummary).toHaveBeenCalledTimes(1);
-    mocks.clearCurrentProviderAuthState.mockClear();
 
     await handler(createOptions({ refresh: true }));
     expect(mocks.buildAuthHealthSummary).toHaveBeenCalledTimes(2);
     expect(mocks.refreshActiveProviderAuthRuntimeSnapshot).toHaveBeenCalledTimes(1);
     expect(mocks.loadDeferredCatalog).toHaveBeenCalledTimes(1);
-    expect(mocks.clearCurrentProviderAuthState).not.toHaveBeenCalled();
   });
 
   it("refreshes the transient owner after secrets runtime refresh", async () => {
@@ -2557,8 +2547,6 @@ describe("models.authLogout", () => {
       profileIds: ["openrouter:default"],
     });
     expect(mocks.refreshActiveProviderAuthRuntimeSnapshot).toHaveBeenCalledTimes(1);
-    expect(mocks.clearCurrentProviderAuthState).toHaveBeenCalled();
-    expect(mocks.warmCurrentProviderAuthStateOffMainThread).toHaveBeenCalledWith({});
     const [ok, payload] = firstRespondCall(opts) ?? [];
     expect(ok).toBe(true);
     expect((payload as ModelAuthLogoutResult).removedProfiles).toEqual(["openrouter:default"]);

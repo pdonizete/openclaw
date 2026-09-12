@@ -12,6 +12,7 @@ import {
   type MemorySearchResult,
   type MemorySource,
 } from "openclaw/plugin-sdk/memory-core-host-engine-storage";
+import { WorkerTaskError } from "openclaw/plugin-sdk/process-runtime";
 import { redactSensitiveText } from "openclaw/plugin-sdk/security-runtime";
 import { uniqueValues } from "openclaw/plugin-sdk/string-coerce-runtime";
 import {
@@ -20,6 +21,7 @@ import {
   type HybridSearchResult,
 } from "./hybrid.js";
 import { applyImportanceMultiplier } from "./importance.js";
+import { runMemoryVectorFallback } from "./manager-cpu-worker-runtime.js";
 import { acquireMemoryIndexReadGeneration } from "./manager-index-generation-lease.js";
 import { MemoryKeywordRetrieval, type KeywordSearchHit } from "./manager-keyword-retrieval.js";
 import { runVectorKnnInSubprocess } from "./manager-search-knn-subprocess.js";
@@ -83,8 +85,8 @@ export abstract class MemorySearchOrchestration extends MemoryKeywordRetrieval {
     normalizedQuery: string,
     opts?: MemoryIndexSearchOptions,
   ): Promise<MemorySearchResult[]> {
-    let releaseGeneration: (() => void) | undefined;
-    return await this.withManagerOperation(async () => {
+    let releaseGeneration: (() => Promise<void>) | undefined;
+    const runSearch = async () => {
       opts?.onDebug?.({ backend: "builtin" });
       if (this.providerRequirement.mode === "required") {
         await this.ensureProviderInitialized();
@@ -101,6 +103,9 @@ export abstract class MemorySearchOrchestration extends MemoryKeywordRetrieval {
             { allowEmbeddingBootstrapFallback: true },
           );
         } catch (err) {
+          if (err instanceof WorkerTaskError && err.code === "overloaded") {
+            throw err;
+          }
           if (this.providerRequirement.mode === "optional" && this.shouldFallbackOnError(err)) {
             const failedProvider = this.provider?.id ?? this.settings.provider;
             await this.retireCurrentProvider().catch((retireErr: unknown) => {
@@ -112,6 +117,9 @@ export abstract class MemorySearchOrchestration extends MemoryKeywordRetrieval {
             this.markEmbeddingBootstrapFailure(err, { provider: failedProvider });
             await this.syncAdmitted({ reason: "search", force: true }).catch(
               (fallbackErr: unknown) => {
+                if (fallbackErr instanceof WorkerTaskError && fallbackErr.code === "overloaded") {
+                  throw fallbackErr;
+                }
                 const message = redactSensitiveText(formatErrorMessage(fallbackErr), {
                   mode: "tools",
                 });
@@ -198,6 +206,9 @@ export abstract class MemorySearchOrchestration extends MemoryKeywordRetrieval {
           { reason: "search", force: true },
           { allowEmbeddingBootstrapFallback: true },
         ).catch((err: unknown) => {
+          if (err instanceof WorkerTaskError && err.code === "overloaded") {
+            throw err;
+          }
           log.warn(`memory sync failed (search-identity-repair): ${formatErrorMessage(err)}`);
         });
       }
@@ -254,8 +265,9 @@ export abstract class MemorySearchOrchestration extends MemoryKeywordRetrieval {
         if (leasedIdentity.status === "valid") {
           break;
         }
-        releaseGeneration();
+        const release = releaseGeneration;
         releaseGeneration = undefined;
+        await release();
         if (
           identityAttempt > 0 ||
           leasedIdentity.status !== "mismatched" ||
@@ -302,9 +314,13 @@ export abstract class MemorySearchOrchestration extends MemoryKeywordRetrieval {
             ? await this.searchKeywordWithFallback(
                 cleaned,
                 candidates,
-                { boostFallbackRanking: true },
+                { boostFallbackRanking: true, signal: opts?.signal },
                 sourceFilterList,
               ).catch((err: unknown) => {
+                opts?.signal?.throwIfAborted();
+                if (err instanceof WorkerTaskError && err.code === "overloaded") {
+                  throw err;
+                }
                 log.warn(`memory search: FTS keyword query failed: ${formatErrorMessage(err)}`);
                 return [];
               })
@@ -392,20 +408,22 @@ export abstract class MemorySearchOrchestration extends MemoryKeywordRetrieval {
             const releaseFallbackProvider = this.acquireProviderUse(semanticProvider);
             try {
               keywordResults = await loadKeywordResults();
-              queryVec = await this.embedQueryWithRetry(
-                cleaned,
-                opts?.signal,
-                semanticProvider,
-                false,
-                semanticProviderRuntime,
-                opts?.[MEMORY_SEARCH_DEADLINE_CONTROL],
-              );
-            } catch (fallbackErr) {
-              releaseFallbackProvider();
-              if (!opts?.signal?.aborted) {
-                this.markLocalEmbeddingProviderDegraded(fallbackErr);
+              try {
+                queryVec = await this.embedQueryWithRetry(
+                  cleaned,
+                  opts?.signal,
+                  semanticProvider,
+                  false,
+                  semanticProviderRuntime,
+                  opts?.[MEMORY_SEARCH_DEADLINE_CONTROL],
+                );
+              } catch (fallbackErr) {
+                releaseFallbackProvider();
+                if (!opts?.signal?.aborted) {
+                  this.markLocalEmbeddingProviderDegraded(fallbackErr);
+                }
+                throw fallbackErr;
               }
-              throw fallbackErr;
             } finally {
               releaseFallbackProvider();
             }
@@ -432,6 +450,9 @@ export abstract class MemorySearchOrchestration extends MemoryKeywordRetrieval {
             opts?.signal,
           ).catch((err: unknown) => {
             opts?.signal?.throwIfAborted();
+            if (err instanceof WorkerTaskError && err.code === "overloaded") {
+              throw err;
+            }
             log.warn(`memory search: vector query failed: ${formatErrorMessage(err)}`);
             return [];
           })
@@ -473,8 +494,13 @@ export abstract class MemorySearchOrchestration extends MemoryKeywordRetrieval {
         maxResults,
         minScore,
       });
-    }).finally(() => {
-      releaseGeneration?.();
+    };
+    return await this.withManagerOperation(async () => {
+      try {
+        return await runSearch();
+      } finally {
+        await releaseGeneration?.();
+      }
     });
   }
 
@@ -510,6 +536,22 @@ export abstract class MemorySearchOrchestration extends MemoryKeywordRetrieval {
       snippetMaxChars: SNIPPET_MAX_CHARS,
       signal,
       ensureVectorReady: async (dimensions) => await this.ensureVectorReady(dimensions),
+      runFallback: () =>
+        runMemoryVectorFallback(
+          {
+            agentId: this.agentId,
+            databasePath: resolveUserPath(this.settings.store.databasePath),
+          },
+          {
+            providerModel: providerIdentity.model,
+            providerModelAliases: providerIdentity.aliases,
+            queryVec,
+            limit,
+            snippetMaxChars: SNIPPET_MAX_CHARS,
+            sourceFilter: this.buildSourceFilter(undefined, sourceFilterList),
+          },
+          signal,
+        ),
       runVectorKnn: async (request, knnSignal) =>
         await runVectorKnnInSubprocess({
           databasePath: resolveUserPath(this.settings.store.databasePath),

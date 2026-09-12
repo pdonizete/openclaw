@@ -2,6 +2,8 @@ import { isDeepStrictEqual } from "node:util";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { resolveAmbientOwnerAgentId } from "../agents/agent-scope-config.js";
 import { resolveAgentDir } from "../agents/agent-scope.js";
+import { withSetupCredentialAccess } from "../agents/auth-profiles/setup-access.js";
+import { loadAuthProfileStoreWithoutExternalProfiles } from "../agents/auth-profiles/store-runtime.js";
 import { resolveCliRuntimeCanonicalProvider } from "../agents/cli-backends.js";
 import { readCodexCliActiveApiKey } from "../agents/cli-credentials.js";
 import {
@@ -11,6 +13,9 @@ import {
   GEMINI_CLI_DEFAULT_MODEL_REF,
   OPENAI_API_DEFAULT_MODEL_REF,
 } from "../commands/onboard-inference.js";
+import { hasResolvedRosterBeforeMigrations } from "../config/agent-roster-provenance.js";
+import { hashConfigRaw } from "../config/io.read-helpers.js";
+import { materializeRuntimeConfig } from "../config/materialize.js";
 import { applyMergePatch, createMergePatch } from "../config/merge-patch.js";
 import { normalizeAgentModelRefForConfig } from "../config/model-input.js";
 import {
@@ -23,6 +28,7 @@ import { registerSecretValueForRedaction } from "../logging/secret-redaction-reg
 import { normalizePluginTargetConfig } from "../plugins/config-state.js";
 import { enablePluginWithCapabilityConsent } from "../plugins/enable.js";
 import { stripPendingPluginInstallRecords } from "../plugins/install-record-commit.js";
+import { createPluginCache } from "../plugins/plugin-cache.js";
 import { withPluginLifecycleLease } from "../plugins/plugin-lifecycle-lease.js";
 import { resolvePluginMetadataSnapshot } from "../plugins/plugin-metadata-snapshot.js";
 import { withPluginRuntimeGenerationScope } from "../plugins/runtime/generation-scope.js";
@@ -58,7 +64,7 @@ import {
   validateSetupInferenceOwnerEvidence,
 } from "./setup-inference-core.js";
 import {
-  forgetSavedSetupCandidate,
+  activateSavedSetupCredential,
   saveSetupCredential,
   stageProviderAuthCandidate,
   stageProviderAutoCandidate,
@@ -118,7 +124,6 @@ async function stageCodexCandidate(ctx: StageContext): Promise<StagedCandidate |
       prompter: ctx.params.prompter ?? createQuickstartNotePrompter(ctx.params.runtime),
       runtime: ctx.params.runtime,
       workspaceDir: ctx.workspace,
-      reviewOfficialArtifacts: true,
       beforePersistentEffect: ctx.beforePersistentEffect,
     });
     if (!ensured.ok) {
@@ -155,12 +160,36 @@ async function stageCodexCandidate(ctx: StageContext): Promise<StagedCandidate |
       allowKeychainPrompt: true,
     });
     let authProfileId: string | undefined;
-    let authenticatedConfig = config;
+    let authenticatedConfig: OpenClawConfig = {
+      ...config,
+      plugins: {
+        ...config.plugins,
+        entries: {
+          ...config.plugins?.entries,
+          codex: {
+            ...entry,
+            enabled: true,
+            config: {
+              ...pluginConfig,
+              appServer: {
+                ...appServer,
+                transport: "stdio",
+                homeScope: credential ? "agent" : "user",
+              },
+            },
+          },
+        },
+      },
+    };
     if (credential) {
       registerSecretValueForRedaction(credential.key);
       const saved = await saveSetupCredential({
         profile: { profileId: "openai:codex-cli-api-key", credential },
-        config,
+        config: authenticatedConfig,
+        baseConfig: ctx.cfg,
+        modelRef,
+        pluginId: "codex",
+        agentRuntimeId: "codex",
         agentDir: ctx.agentDir,
         beforePersistentEffect: () => ctx.beforePersistentEffect("credential"),
       });
@@ -173,27 +202,7 @@ async function stageCodexCandidate(ctx: StageContext): Promise<StagedCandidate |
       agentRuntimeId: "codex",
       ...(authProfileId ? { authProfileId } : {}),
       pendingPluginInstalls: config.plugins?.installs,
-      config: {
-        ...authenticatedConfig,
-        plugins: {
-          ...authenticatedConfig.plugins,
-          entries: {
-            ...authenticatedConfig.plugins?.entries,
-            codex: {
-              ...entry,
-              enabled: true,
-              config: {
-                ...pluginConfig,
-                appServer: {
-                  ...appServer,
-                  transport: "stdio",
-                  homeScope: credential ? "agent" : "user",
-                },
-              },
-            },
-          },
-        },
-      },
+      config: authenticatedConfig,
     };
   });
 }
@@ -347,7 +356,6 @@ async function activateCandidate(
     throw new Error(invalidSetupConfigError(snapshot));
   }
   const cfg = snapshot.runtimeConfig ?? snapshot.config;
-  const source = snapshot.sourceConfig;
   const routeAgentId = resolveAmbientOwnerAgentId(cfg, params.agentId);
   const ctx: StageContext = {
     params,
@@ -379,6 +387,26 @@ async function activateCandidate(
   if ("error" in staged) {
     return failure({ ok: false, status: "unavailable", error: staged.error });
   }
+  const verify = () => verifyAndActivateCandidate(ctx, staged, failure);
+  return staged.authProfileId
+    ? await withSetupCredentialAccess(
+        { profileId: staged.authProfileId, agentDir: ctx.agentDir, signal: params.signal },
+        verify,
+      )
+    : await verify();
+}
+
+async function verifyAndActivateCandidate(
+  ctx: StageContext,
+  staged: StagedCandidate,
+  failure: (
+    result: Extract<ActivateSetupInferenceResult, { ok: false }>,
+  ) => ActivateSetupInferenceResult,
+): Promise<ActivateSetupInferenceResult> {
+  const { params, deps, snapshot, cfg, routeAgentId } = ctx;
+  const source = snapshot.sourceConfig;
+  const readSnapshot =
+    deps.readConfigFileSnapshot ?? (await import("../config/config.js")).readConfigFileSnapshot;
   const catalogPreference = resolveSetupNativeSessionCatalogPreference({
     consentRequired: requiresSetupNativeSessionCatalogConsent({
       configExists: snapshot.exists,
@@ -405,6 +433,7 @@ async function activateCandidate(
           model: staged.modelRef,
           ...(params.agentId ? { targetAgentId: routeAgentId } : {}),
           ...(staged.agentRuntimeId ? { agentRuntimeId: staged.agentRuntimeId } : {}),
+          runtimeInDefaults: !params.agentId && !hasResolvedRosterBeforeMigrations(snapshot),
           ...(staged.authProfileId ? { authProfileId: staged.authProfileId } : {}),
         });
   const buildCandidate = (base: OpenClawConfig) => {
@@ -421,10 +450,12 @@ async function activateCandidate(
   const candidate = buildCandidate(cfg);
   const sourceCandidate = buildCandidate(source);
   const resolveMetadata = deps.resolvePluginMetadataSnapshot ?? resolvePluginMetadataSnapshot;
+  await using cache = createPluginCache();
   const generation =
     staged.pendingPluginInstalls && Object.keys(staged.pendingPluginInstalls).length > 0
       ? await withPluginLifecycleLease({ signal: params.signal }, async () =>
           loadSetupInferencePluginGeneration({
+            cache,
             config: candidate,
             workspaceDir: ctx.workspace,
             selection: {
@@ -446,8 +477,14 @@ async function activateCandidate(
     loadAuthProfileStoreForRuntime: deps.loadAuthProfileStoreForRuntime,
   };
   const requestedAgentId = params.agentId ? routeAgentId : undefined;
+  // Saved model rows stay sparse; compare the same runtime defaults before and after writing.
   const project = (config: OpenClawConfig, sourceConfig: OpenClawConfig) =>
-    projectInferenceRoute(config, requestedAgentId, routeDeps, sourceConfig);
+    projectInferenceRoute(
+      materializeRuntimeConfig(config, { manifestRegistry: { plugins: [...metadata.plugins] } }),
+      requestedAgentId,
+      routeDeps,
+      sourceConfig,
+    );
   const resolveRoute = (config: OpenClawConfig, currentSnapshot = snapshot) =>
     resolveSystemAgentConfiguredRouteFromConfig(
       config,
@@ -503,6 +540,26 @@ async function activateCandidate(
   });
   if (ownerFailure) {
     return failure(ownerFailure);
+  }
+  const savedCredential = staged.authProfileId
+    ? loadAuthProfileStoreWithoutExternalProfiles(ctx.agentDir).profiles[staged.authProfileId]
+    : undefined;
+  if (savedCredential?.setup?.replacement && !params.activationConfirmed) {
+    if (
+      !params.prompter ||
+      !(await params.prompter.confirm({
+        message: "Connection verified. Activate this saved sign-in?",
+        initialValue: true,
+      }))
+    ) {
+      return failure({
+        ok: false,
+        status: "unavailable",
+        error:
+          "Activation declined. The saved sign-in is inactive and your current connection is unchanged.",
+      });
+    }
+    throwIfSetupInferenceCancelled(params);
   }
   const revalidate = async (currentSnapshot: ConfigFileSnapshot) => {
     const config = currentSnapshot.runtimeConfig ?? currentSnapshot.config;
@@ -580,8 +637,45 @@ async function activateCandidate(
     const latest = await readSnapshot();
     await revalidate(latest);
   }
-  if (staged.authProfileId) {
-    forgetSavedSetupCandidate(ctx.agentDir, staged.authProfileId);
+  if (staged.authProfileId && savedCredential?.setup) {
+    const profileId = staged.authProfileId;
+    const activate = async () => {
+      await withSetupCredentialAccess(
+        { profileId, agentDir: ctx.agentDir, signal: params.signal },
+        async () => {
+          const latest = await readSnapshot();
+          const current = latest.runtimeConfig ?? latest.config;
+          if (
+            !sameDefaultInferenceRoute(await project(current, latest.sourceConfig), verifiedRoute)
+          ) {
+            throw new SetupInferenceOwnerDriftError(
+              "The connection changed before credential activation. Test the saved sign-in again.",
+            );
+          }
+          await withGeneration(() =>
+            revalidateStableSetupInferenceOwner({
+              route,
+              auth: turn.auth,
+              stagedOwnerPluginArtifacts: artifacts,
+              deps,
+            }),
+          );
+          await activateSavedSetupCredential({
+            agentDir: ctx.agentDir,
+            profileId,
+            credential: savedCredential,
+            beforeWrite: () => throwIfSetupInferenceCancelled(params),
+          });
+        },
+      );
+    };
+    if (params.surface === "cli" || !gatewayRestartRequired) {
+      if (params.onCredentialActivation) {
+        params.onCredentialActivation(activate);
+      } else {
+        await activate();
+      }
+    }
   }
   const lines = [`Inference verified: ${staged.modelRef}`];
   if (params.surface === "gateway" && params.recordSetupAudit !== false) {
@@ -591,8 +685,8 @@ async function activateCandidate(
         operation: "openclaw.setup",
         summary: "Verified and configured AI access through OpenClaw setup",
         configPath: after?.path ?? snapshot.path,
-        configHashBefore: snapshot.hash ?? null,
-        configHashAfter: after?.hash ?? null,
+        configHashBefore: hashConfigRaw(snapshot.raw),
+        configHashAfter: after ? hashConfigRaw(after.raw) : null,
         details: { modelRef: staged.modelRef, inferenceKind: params.kind },
       });
     } catch (error) {

@@ -356,7 +356,7 @@ vi.mock("../../tasks/cron-run-continuation-cleanup.js", () => ({
   removeCronRunContinuationSessionIfIdle: removeCronRunContinuationSessionIfIdleMock,
 }));
 
-vi.mock("../../gateway/call.runtime.js", () => ({
+vi.mock("../../gateway/call.js", () => ({
   callGateway: callGatewayMock,
 }));
 
@@ -592,7 +592,7 @@ function resetRunConfigMocks(): void {
         pluginMetadataSnapshot: metadata,
         pluginRegistry: registry,
       },
-      release: vi.fn(),
+      [Symbol.asyncDispose]: vi.fn(async () => {}),
     };
   });
   loadModelCatalogOwnerMock.mockImplementation(

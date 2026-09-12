@@ -55,7 +55,6 @@ type ResolvedSettings = {
 type ResolvedRuntimeSettings = ResolvedSettings & { rolling: boolean };
 export type LoggerResolvedSettings = ResolvedSettings;
 type TsLogRecord = Record<string, unknown>;
-type LoggerConfigLoader = () => OpenClawConfig["logging"] | undefined;
 
 type DiagnosticLogCode = {
   line?: number;
@@ -64,9 +63,6 @@ type DiagnosticLogCode = {
 
 const MAX_DIAGNOSTIC_LOG_BINDINGS_JSON_CHARS = 8 * 1024;
 const MAX_DIAGNOSTIC_LOG_MESSAGE_CHARS = 4 * 1024;
-
-const loadLoggerConfigDefault: LoggerConfigLoader = () => readLoggingConfig();
-let loadLoggerConfig: LoggerConfigLoader = loadLoggerConfigDefault;
 
 function invalidateLoggerSettings(): void {
   loggingState.cachedLogger = null;
@@ -81,14 +77,6 @@ export function applyLoggingConfig(config: OpenClawConfig["logging"] | undefined
   invalidateLoggerSettings();
 }
 
-export function setLoggerConfigLoaderForTests(loader?: LoggerConfigLoader): void {
-  loadLoggerConfig = loader ?? loadLoggerConfigDefault;
-  invalidateLoggerSettings();
-}
-
-export function readLoggerConfig(): OpenClawConfig["logging"] | undefined {
-  return loadLoggerConfig();
-}
 const MAX_DIAGNOSTIC_LOG_ATTRIBUTE_COUNT = 32;
 const MAX_DIAGNOSTIC_LOG_ATTRIBUTE_VALUE_CHARS = 2 * 1024;
 const MAX_DIAGNOSTIC_LOG_NAME_CHARS = 120;
@@ -473,19 +461,22 @@ function redactLogRecordForTransport<T extends LogObj>(record: T): T {
 }
 
 function attachDiagnosticEventTransport(logger: TsLogger<LogObj>): void {
-  logger.attachTransport((logObj: LogObj) => {
-    if (!areDiagnosticsEnabledForProcess() || !hasInternalDiagnosticEventInterest("log.record")) {
-      return;
-    }
-    try {
-      const record = buildDiagnosticLogRecord(redactLogRecordForTransport(logObj) as TsLogRecord);
-      const emit = record.trustedTraceContext
-        ? emitDiagnosticEventWithTrustedTraceContext
-        : emitDiagnosticEvent;
-      emit(record.event);
-    } catch {
-      // never block on logging failures
-    }
+  logger.attachTransport({
+    format: () => "",
+    write: (logObj: LogObj) => {
+      if (!areDiagnosticsEnabledForProcess() || !hasInternalDiagnosticEventInterest("log.record")) {
+        return;
+      }
+      try {
+        const record = buildDiagnosticLogRecord(redactLogRecordForTransport(logObj) as TsLogRecord);
+        const emit = record.trustedTraceContext
+          ? emitDiagnosticEventWithTrustedTraceContext
+          : emitDiagnosticEvent;
+        emit(record.event);
+      } catch {
+        // never block on logging failures
+      }
+    },
   });
 }
 
@@ -533,7 +524,7 @@ function resolveSettings(): ResolvedRuntimeSettings {
   }
 
   const cfg: OpenClawConfig["logging"] | LoggerSettings | undefined =
-    (loggingState.overrideSettings as LoggerSettings | null) ?? loadLoggerConfig();
+    (loggingState.overrideSettings as LoggerSettings | null) ?? readLoggingConfig();
   const defaultLevel =
     process.env.VITEST === "true" && process.env.OPENCLAW_TEST_FILE_LOG !== "1" ? "silent" : "info";
   const fromConfig = normalizeLogLevel(cfg?.level, defaultLevel);
@@ -603,47 +594,52 @@ class RuntimeLogger extends TsLogger<LogObj> {
 function buildLogger(): TsLogger<LogObj> {
   const logger = new RuntimeLogger({
     name: "openclaw",
-    maskValuesOfKeys: [],
+    mask: { keys: [] },
+    meta: { property: "_meta" },
     minLevel: levelToMinLevel("fatal"),
     type: "hidden", // no ansi formatting
   });
   inheritLogLevel(logger, () => levelToMinLevel(getRuntimeSettings().level));
   let activeFile: string | undefined;
-  logger.attachTransport((logObj: LogObj) => {
-    try {
-      const settings = getRuntimeSettings();
-      if (settings.level === "silent") {
-        return;
-      }
-      const nextActiveFile = resolveActiveLogFileWithMode(settings.file, settings.rolling);
-      if (nextActiveFile !== activeFile) {
-        activeFile = nextActiveFile;
-        fs.mkdirSync(path.dirname(activeFile), { recursive: true });
-        if (settings.rolling) {
-          pruneOldRollingLogs(path.dirname(activeFile));
+  logger.attachTransport({
+    // OpenClaw owns redacted serialization; tslog's formatted line is unused.
+    format: () => "",
+    write: (logObj: LogObj) => {
+      try {
+        const settings = getRuntimeSettings();
+        if (settings.level === "silent") {
+          return;
         }
+        const nextActiveFile = resolveActiveLogFileWithMode(settings.file, settings.rolling);
+        if (nextActiveFile !== activeFile) {
+          activeFile = nextActiveFile;
+          fs.mkdirSync(path.dirname(activeFile), { recursive: true });
+          if (settings.rolling) {
+            pruneOldRollingLogs(path.dirname(activeFile));
+          }
+        }
+        const time = formatTimestamp(logObj.date ?? new Date(), { style: "long" });
+        const fields = buildFileLogFields(logObj as TsLogRecord);
+        const record = {
+          ...logObj,
+          _meta: withResolvedLogMetaHostname(
+            logObj["_meta"],
+            expectDefined(fields.hostname, "structured log hostname"),
+          ),
+          time,
+          ...fields,
+        };
+        const line = redactSensitiveText(JSON.stringify(redactLogRecordForTransport(record)));
+        fileLogTransport.enqueue({
+          file: activeFile,
+          hostname: expectDefined(fields.hostname, "structured log hostname"),
+          maxFileBytes: settings.maxFileBytes,
+          payload: `${line}\n`,
+        });
+      } catch {
+        // never block on logging failures
       }
-      const time = formatTimestamp(logObj.date ?? new Date(), { style: "long" });
-      const fields = buildFileLogFields(logObj as TsLogRecord);
-      const record = {
-        ...logObj,
-        _meta: withResolvedLogMetaHostname(
-          logObj["_meta"],
-          expectDefined(fields.hostname, "structured log hostname"),
-        ),
-        time,
-        ...fields,
-      };
-      const line = redactSensitiveText(JSON.stringify(redactLogRecordForTransport(record)));
-      fileLogTransport.enqueue({
-        file: activeFile,
-        hostname: expectDefined(fields.hostname, "structured log hostname"),
-        maxFileBytes: settings.maxFileBytes,
-        payload: `${line}\n`,
-      });
-    } catch {
-      // never block on logging failures
-    }
+    },
   });
   attachDiagnosticEventTransport(logger);
 
@@ -681,7 +677,7 @@ export function getChildLogger(
   });
 }
 
-// Baileys expects a pino-like logger shape. Provide a lightweight adapter.
+// Preserve variadic, object-first consumers through tslog's generic log entrypoint.
 export function toPinoLikeLogger(logger: TsLogger<LogObj>, level: LogLevel): PinoLikeLogger {
   return {
     level,
@@ -694,12 +690,12 @@ export function toPinoLikeLogger(logger: TsLogger<LogObj>, level: LogLevel): Pin
       inheritLogLevel(child, () => logger.settings.minLevel);
       return toPinoLikeLogger(child, level);
     },
-    trace: (...args: unknown[]) => logger.trace(...args),
-    debug: (...args: unknown[]) => logger.debug(...args),
-    info: (...args: unknown[]) => logger.info(...args),
-    warn: (...args: unknown[]) => logger.warn(...args),
-    error: (...args: unknown[]) => logger.error(...args),
-    fatal: (...args: unknown[]) => logger.fatal(...args),
+    trace: (...args: unknown[]) => logger.log(levelToMinLevel("trace"), "TRACE", ...args),
+    debug: (...args: unknown[]) => logger.log(levelToMinLevel("debug"), "DEBUG", ...args),
+    info: (...args: unknown[]) => logger.log(levelToMinLevel("info"), "INFO", ...args),
+    warn: (...args: unknown[]) => logger.log(levelToMinLevel("warn"), "WARN", ...args),
+    error: (...args: unknown[]) => logger.log(levelToMinLevel("error"), "ERROR", ...args),
+    fatal: (...args: unknown[]) => logger.log(levelToMinLevel("fatal"), "FATAL", ...args),
   };
 }
 
@@ -734,7 +730,6 @@ export function resetLogger() {
   loggingState.appliedConfig = APPLIED_LOGGING_CONFIG_UNOWNED;
   loggingState.overrideSettings = null;
   invalidateLoggingConfigCache();
-  loadLoggerConfig = loadLoggerConfigDefault;
   loggerHostnameState.resolver = defaultLoggerHostnameResolver;
   loggerHostnameState.cached = null;
   invalidateLoggerSettings();

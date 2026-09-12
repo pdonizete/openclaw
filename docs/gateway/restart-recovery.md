@@ -195,6 +195,16 @@ After activation, the updater verifies that the managed service is running and
 owns its port, the Gateway hello handshake matches the expected version/build
 identity, a 12-probe health settle passes, plugins and channels are healthy, and
 `/readyz` returns HTTP 200. Update verification does not use model inference.
+Startup receives the update's existing per-step `--timeout` budget (1800 seconds
+by default), including migration and listener initialization, followed by the
+12-probe settle window. On the first update from an older release, the old updater
+invokes the newly installed CLI but does not pass that readiness budget. The
+candidate recognizes the existing update marker and, once the managed process is
+running, uses the five-minute startup watchdog instead of the standalone
+60-second deadline. Migration, listener, and health transitions do not reset this
+bound. The old updater's subprocess timeout also remains in force. An exhausted
+wait reports the last observed startup phase. Standalone restart deadlines are
+unchanged.
 Verification facts and measured downtime are retained in the
 [update run report](/cli/update#run-history-and-reports).
 
@@ -337,6 +347,13 @@ After the durable budget is exhausted, the session is tombstoned instead of
 looping forever. Inspect the failed session and use `/new` or `/reset` to start a
 replacement. `openclaw doctor --fix` can repair a stale aborted flag that
 conflicts with a tombstone, but it does not re-enable that recovery cycle.
+
+If you message the failed session again in a channel, OpenClaw sends a short
+recovery reminder through that channel and logs each rejected message at warn
+level with the session key, recovery reason, and recovery command. Repeated
+reminders are suppressed in a bounded memory cache. Resetting or deleting the
+session, or restarting the Gateway, clears that suppression. Sessions with locked
+model selection instead direct you to **Resume in new session** in WebChat.
 
 Every retry reuses one durable dispatch identifier, so an ambiguous connection
 failure cannot start the same recovery twice. Completed Control UI turns also

@@ -24,6 +24,7 @@ export function buildBaseOptions(
   const baseOptions = {
     temperature: options?.temperature,
     maxTokens: options?.maxTokens,
+    responseFormat: options?.responseFormat,
     stop: options?.stop,
     signal: options?.signal,
     apiKey: apiKey || options?.apiKey,
@@ -55,7 +56,7 @@ export function clampMaxTokensToModel(
 ): number | undefined {
   return requestedMaxTokens === undefined
     ? undefined
-    : Math.max(1, Math.min(requestedMaxTokens, model.maxTokens));
+    : Math.max(1, Math.min(requestedMaxTokens, model.maxTokens ?? requestedMaxTokens));
 }
 
 export function clampReasoning(effort: ThinkingLevel): Exclude<ThinkingLevel, "xhigh">;

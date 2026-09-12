@@ -34,12 +34,21 @@ export type WorkboardKeyedStore<T = PersistedWorkboardCard> = {
   entries(): Promise<Array<{ key: string; value: T }>>;
 };
 
-export type WorkboardBoardCardAggregate = {
+type WorkboardBoardCardAggregate = {
   boardId: string;
   status: WorkboardCard["status"];
   total: number;
   archived: number;
   updatedAt: number;
+};
+
+export type WorkboardCardStatsAggregate = {
+  status: WorkboardCard["status"];
+  agentId: string | undefined;
+  total: number;
+  archived: number;
+  updatedAt: number;
+  oldestReadyAt: number | undefined;
 };
 
 export type WorkboardOwnerClaimResult = "updated" | "conflict" | "owner_busy";
@@ -60,19 +69,6 @@ export type WorkboardCardStore = WorkboardKeyedStore & {
     now: number,
   ): Promise<WorkboardOwnerClaimResult>;
   listBoardAggregates(): Promise<WorkboardBoardCardAggregate[]>;
+  listStatsAggregates(boardId?: string): Promise<WorkboardCardStatsAggregate[]>;
+  hasCards(boardId: string): Promise<boolean>;
 };
-
-export function isWorkboardCardStore(store: WorkboardKeyedStore): store is WorkboardCardStore {
-  return (
-    "listBoardAggregates" in store &&
-    typeof store.listBoardAggregates === "function" &&
-    "registerIfAbsent" in store &&
-    typeof store.registerIfAbsent === "function" &&
-    "registerIfUpdatedAt" in store &&
-    typeof store.registerIfUpdatedAt === "function" &&
-    "claimIfOwnerAvailable" in store &&
-    typeof store.claimIfOwnerAvailable === "function" &&
-    "deleteIfUpdatedAt" in store &&
-    typeof store.deleteIfUpdatedAt === "function"
-  );
-}

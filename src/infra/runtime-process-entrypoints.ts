@@ -4,6 +4,26 @@ const currentModuleUrl = import.meta.url;
 export const SQLITE_READONLY_CHILD_ARG = "--openclaw-sqlite-readonly-child";
 
 export const runtimeProcessEntrypoints = {
+  imageProcessor: {
+    currentModuleUrl,
+    sourceWorkerName: "../media/image-processor.worker",
+    distWorkerPath: "media/image-processor.worker.js",
+  },
+  gitOperations: {
+    currentModuleUrl,
+    sourceWorkerName: "git-operation.worker",
+    distWorkerPath: "infra/git-operation.worker.js",
+  },
+  sharedStateStore: {
+    currentModuleUrl,
+    sourceWorkerName: "../state/openclaw-state.worker",
+    distWorkerPath: "state/openclaw-state.worker.js",
+  },
+  sqliteStore: {
+    currentModuleUrl,
+    sourceWorkerName: "sqlite-store.worker",
+    distWorkerPath: "infra/sqlite-store.worker.js",
+  },
   stateMigrationSnapshot: {
     currentModuleUrl,
     sourceWorkerName: "state-migrations.snapshot.worker",
@@ -58,6 +78,11 @@ export const runtimeProcessEntrypoints = {
     currentModuleUrl,
     sourceWorkerName: "../config/sessions/session-accessor.sqlite-archive.worker",
     distWorkerPath: "config/sessions/session-accessor.sqlite-archive.worker.js",
+  },
+  sessionModelContext: {
+    currentModuleUrl,
+    sourceWorkerName: "../config/sessions/session-model-context.worker",
+    distWorkerPath: "config/sessions/session-model-context.worker.js",
   },
   sessionTranscriptReconcile: {
     currentModuleUrl,

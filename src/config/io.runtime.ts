@@ -1,5 +1,8 @@
 import fs from "node:fs";
+import { expectDefined } from "@openclaw/normalization-core";
+import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { formatErrorMessage } from "../infra/errors.js";
+import { recordUpdateDoctorConfigWrite } from "../infra/update-doctor-result.js";
 import { cloneEnvWithPlatformSemantics, createConfigRuntimeEnvBase } from "./config-env-vars.js";
 import { resolveManagedUnsetPathsForWrite } from "./config-path-mutation.js";
 import { assertConfigWriteAllowedInCurrentMode } from "./config-write-guard.js";
@@ -8,6 +11,7 @@ import { GATEWAY_CONFIG_SELECTION_ENV_KEYS } from "./gateway-env-selection.js";
 import { createConfigIO } from "./io.factory.js";
 import {
   createManagedRuntimeEnvBase,
+  hashConfigRaw,
   replaceEnvSnapshot,
   resolveManagedRuntimeEnvBaseline,
   restoreEnvChangesIfUnchanged,
@@ -23,6 +27,7 @@ import type {
   ReadConfigFileSnapshotWithPluginMetadataResult,
 } from "./io.types.js";
 import { ConfigRuntimeRefreshError, configWritePostCommitRollback } from "./io.types.js";
+import { ConfigWritePostCommitError, type ConfigWriteRollbackStatus } from "./io.write-errors.js";
 import { rollbackConfigFileWriteIfUnchanged } from "./io.write-safety.js";
 import { formatConfigIssueSummary } from "./issue-format.js";
 import { ConfigMutationConflictError } from "./mutation-conflict.js";
@@ -49,7 +54,7 @@ import {
   getRuntimeConfigWriteApplication,
 } from "./runtime-write-application.js";
 import type { ConfigFileSnapshot, OpenClawConfig } from "./types.js";
-import { withConfigWriteLock } from "./write-lock.js";
+import { captureConfigWriteLockGuard, withConfigWriteLock } from "./write-lock.js";
 
 export { createConfigIO };
 
@@ -242,8 +247,12 @@ export async function readConfigFileSnapshotForRuntimeTransaction(
 
 export async function readConfigFileSnapshotForWrite(options?: {
   skipPluginValidation?: boolean;
+  observe?: boolean;
 }): Promise<ReadConfigFileSnapshotForWriteResult> {
-  const readOptions = options?.skipPluginValidation ? { pluginValidation: "skip" as const } : {};
+  const readOptions = {
+    ...(options?.skipPluginValidation ? { pluginValidation: "skip" as const } : {}),
+    ...(options?.observe === false ? { observe: false } : {}),
+  };
   for (let attempt = 0; attempt < 3; attempt += 1) {
     try {
       const processIo = createConfigIO(readOptions);
@@ -274,6 +283,7 @@ export async function writeConfigFile(
   const ioOptions = {
     ...(options.ownedConfigPathForWrite ? { configPath: options.ownedConfigPathForWrite } : {}),
     ...(options.skipPluginValidation ? { pluginValidation: "skip" as const } : {}),
+    ...(options.observe === false ? { observe: false } : {}),
     ...(options.preservedLegacyRootKeys
       ? { preservedLegacyRootKeys: options.preservedLegacyRootKeys }
       : {}),
@@ -309,6 +319,9 @@ export async function writeConfigFile(
       }
       let runtimePreflightResult: unknown;
       let managedPreparedCandidates = new Map<symbol, RuntimeConfigWritePreparedCandidate>();
+      // Finalization outlives the nested factory lock. Its compensation keeps
+      // this original outer owner, never the closed factory scope or a later owner.
+      const assertPostCommitCurrent = captureConfigWriteLockGuard(io.configPath);
       const writeResult = await io.writeConfigFile(nextCfg, {
         // Preserve caller policy and provenance; runtime-owned fields take precedence below.
         ...options,
@@ -369,9 +382,14 @@ export async function writeConfigFile(
         deferRuntimeActivation,
         runtimePreflightResult,
         managedPreparedCandidates,
+        assertPostCommitCurrent,
+        rollbackWriteEffects: writeResult[configWritePostCommitRollback]?.bind(undefined, () =>
+          assertPostCommitCurrent?.(),
+        ),
       });
     },
     processIo.env,
+    options.assertCurrent,
   );
 }
 
@@ -386,6 +404,8 @@ async function finalizeCommittedConfigWrite(params: {
   deferRuntimeActivation: boolean;
   runtimePreflightResult: unknown;
   managedPreparedCandidates: Map<symbol, RuntimeConfigWritePreparedCandidate>;
+  assertPostCommitCurrent?: () => void;
+  rollbackWriteEffects?: () => void;
 }): Promise<ConfigWriteResult> {
   const {
     io,
@@ -397,6 +417,7 @@ async function finalizeCommittedConfigWrite(params: {
   } = params;
   let canonicalSourceConfig = params.nextCfg;
   let canonicalRuntimeConfig = params.nextCfg;
+  let canonicalPersistedHash = writeResult.persistedHash;
   let envBeforeCanonicalRead = snapshotEnv(io.env);
   let envAfterCanonicalRead: Record<string, string | undefined>;
   let canonicalReadFailure: ConfigRuntimeRefreshError | null = null;
@@ -417,6 +438,10 @@ async function finalizeCommittedConfigWrite(params: {
       if (freshSnapshot.exists && freshSnapshot.valid) {
         canonicalSourceConfig = freshSnapshot.sourceConfig;
         canonicalRuntimeConfig = freshSnapshot.config;
+        canonicalPersistedHash = expectDefined(
+          freshSnapshot.hash,
+          "canonical config snapshot hash",
+        );
       } else {
         // An invalid or vanished reread means a concurrent edit beat us to the
         // file; runtime keeps the just-written config, but that divergence must
@@ -438,12 +463,12 @@ async function finalizeCommittedConfigWrite(params: {
     }
     if (!stableEnvGeneration) {
       canonicalReadFailure = new ConfigRuntimeRefreshError(
-        `Config was written to ${io.configPath}, but the active config environment changed during every canonical reread`,
+        "the active config environment changed during every canonical reread",
       );
     }
   } catch (error) {
     canonicalReadFailure = new ConfigRuntimeRefreshError(
-      `Config was written to ${io.configPath}, but the canonical reread failed: ${formatErrorMessage(error)}`,
+      `canonical reread failed: ${formatErrorMessage(error)}`,
       { cause: error },
     );
   } finally {
@@ -476,7 +501,7 @@ async function finalizeCommittedConfigWrite(params: {
           configPath: io.configPath,
           sourceConfig: canonicalSourceConfig,
           runtimeConfig: notificationRuntimeConfig,
-          persistedHash: writeResult.persistedHash,
+          persistedHash: canonicalPersistedHash,
           afterWrite: options.afterWrite,
           runtimeRefresh: options.runtimeRefresh,
           ...(notificationPreparedCandidates.size > 0
@@ -494,6 +519,7 @@ async function finalizeCommittedConfigWrite(params: {
     }
     options.assertConfigPathForWrite?.();
     await finalizeRuntimeSnapshotWrite({
+      assertCurrent: params.assertPostCommitCurrent,
       nextSourceConfig: canonicalSourceConfig,
       refreshOptions: options.runtimeRefresh,
       hadRuntimeSnapshot: params.hadRuntimeSnapshot,
@@ -504,34 +530,51 @@ async function finalizeCommittedConfigWrite(params: {
       preflightResult: params.runtimePreflightResult,
       deferRuntimeActivation,
       createRefreshError: (detail, cause) =>
-        new ConfigRuntimeRefreshError(
-          `Config was written to ${io.configPath}, but runtime snapshot refresh failed: ${detail}`,
-          { cause },
-        ),
+        new ConfigRuntimeRefreshError(`runtime snapshot refresh failed: ${detail}`, { cause }),
     });
   } catch (error) {
+    let rollbackStatus: ConfigWriteRollbackStatus = "unknown";
     try {
       const rolledBackConfig = await rollbackConfigFileWriteIfUnchanged({
         configPath: io.configPath,
         previousSnapshot: baseSnapshot,
         committedHash: writeResult.persistedHash,
         fsModule: fs,
+        assertCurrent: params.assertPostCommitCurrent,
       });
+      rollbackStatus = rolledBackConfig ? "restored" : "not-restored";
       if (rolledBackConfig) {
+        params.assertPostCommitCurrent?.();
+        recordUpdateDoctorConfigWrite(
+          io.configPath,
+          writeResult.persistedHash,
+          hashConfigRaw(baseSnapshot.raw),
+          writeResult.persistedConfig,
+          JSON.stringify(isRecord(baseSnapshot.parsed) ? baseSnapshot.parsed : {}),
+        );
         restoreEnvChangesIfUnchanged({
           env: io.env,
           before: envBeforeCanonicalRead,
           after: envAfterCanonicalRead,
         });
-        writeResult[configWritePostCommitRollback]?.();
+        params.rollbackWriteEffects?.();
       }
     } catch (rollbackError) {
-      throw new ConfigRuntimeRefreshError(
-        `${formatErrorMessage(error)} Rollback failed: ${formatErrorMessage(rollbackError)}`,
-        { cause: error },
-      );
+      throw new ConfigWritePostCommitError({
+        configPath: io.configPath,
+        rollbackStatus,
+        cause: new AggregateError(
+          [error, rollbackError],
+          `${formatErrorMessage(error)} Recovery failed: ${formatErrorMessage(rollbackError)}`,
+          { cause: rollbackError },
+        ),
+      });
     }
-    throw error;
+    throw new ConfigWritePostCommitError({
+      configPath: io.configPath,
+      rollbackStatus,
+      cause: error,
+    });
   }
   return writeResult;
 }

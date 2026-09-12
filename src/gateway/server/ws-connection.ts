@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
 import type { WebSocket, WebSocketServer } from "ws";
 import { WORKER_PROTOCOL_MAX_PAYLOAD_BYTES } from "../../../packages/gateway-protocol/src/index.js";
+import { GATEWAY_SERVER_CAPS } from "../../../packages/gateway-protocol/src/server-capabilities.js";
 import { GATEWAY_STARTUP_PENDING_CLOSE_CAUSE } from "../../../packages/gateway-protocol/src/startup-unavailable.js";
 import { getRuntimeConfig } from "../../config/io.js";
 import { recordPairedNodeDisconnection } from "../../infra/device-pairing-node.js";
@@ -353,7 +354,11 @@ export function attachGatewayWsConnectionHandler(params: AttachGatewayWsConnecti
       send({
         type: "event",
         event: "connect.challenge",
-        payload: { nonce: connectNonce, ts: Date.now() },
+        payload: {
+          nonce: connectNonce,
+          ts: Date.now(),
+          capabilities: [GATEWAY_SERVER_CAPS.MODEL_CATALOG_SNAPSHOT],
+        },
       });
     }
     advanceHandshakePhase("ws_upgrade_started");
@@ -617,16 +622,20 @@ export function attachGatewayWsConnectionHandler(params: AttachGatewayWsConnecti
         next.personPresence = { onlineSince: Date.now() };
         refreshClientPresence(clients, next);
       }
-      stopKeepalive = startWebSocketKeepalive(socket, (diagnostics) => {
-        // A half-open control connection must release its node and worker owners.
-        heartbeatDiagnostics = diagnostics;
-        setCloseCause("heartbeat-timeout");
-        try {
-          socket.terminate();
-        } catch {
-          close();
-        }
-      });
+      stopKeepalive = startWebSocketKeepalive(
+        socket,
+        (diagnostics) => {
+          // A half-open control connection must release its node and worker owners.
+          heartbeatDiagnostics = diagnostics;
+          setCloseCause("heartbeat-timeout");
+          try {
+            socket.terminate();
+          } catch {
+            close();
+          }
+        },
+        upgradeReq.socket,
+      );
       return true;
     };
 

@@ -18,7 +18,7 @@ OpenClaw has two log surfaces:
 At startup, the Gateway logs the resolved default agent model plus the mode defaults that affect new sessions:
 
 ```text
-agent model: openai/gpt-5.6-sol (thinking=medium, fast=on)
+agent model: openai/gpt-6-astra (thinking=medium, fast=on)
 ```
 
 `thinking` comes from the default agent, model params, or the global agent default. When unset it shows `medium`. `fast` comes from the default agent or the model's `fastMode` params.
@@ -157,7 +157,7 @@ secrets instead of relying on key-name matching. Other transcript fields and
 diagnostic sinks retain broad assignment matching.
 
 - Sensitive-value redaction is always enabled.
-- `logging.redactPatterns`: array of regex strings (overrides defaults)
+- `logging.redactPatterns`: array of regex strings (replaces the default string list). Built-in structural protections for form bodies, structured authorization headers, and bare AWS secret access keys always apply.
   - Use raw regex strings (auto `gi`), or `/pattern/flags` for custom flags.
   - Matches are masked keeping the first 6 + last 4 chars (values >= 18 chars). Shorter values become `***`.
   - Defaults cover common key assignments, CLI flags, JSON fields, bearer headers, PEM blocks, popular vendor token prefixes, and payment credential field names (card number, CVC/CVV, shared payment token, payment credential).
@@ -170,6 +170,23 @@ The gateway prints WebSocket protocol logs in two modes:
 
 - **Normal mode (no `--verbose`)**: only "interesting" RPC results print - errors (`ok=false`), slow calls (default threshold: `>= 50ms`), and parse errors.
 - **Verbose mode (`--verbose`)**: prints all WS request/response traffic.
+
+With `diagnostics.enabled: true` and warning logging enabled, `sessions.list`
+handlers taking at least one second also emit `slow session list`. The record
+includes process/thread identity, the request trace, and `cacheRole`: a completed
+cache hit, an in-flight follower, a projection owner, or `unreached` if the handler
+failed before selecting a cache path. Followers can include `workTraceId` and
+`workSpanId` to identify the request producing their shared result. Successful
+list results report `selectedRowCount` for every cache role.
+
+Projection owners report phase totals, visibility-repair counts, synchronous
+preparation/row time, and `yieldWaitMs`/`yieldCount` for time spent awaiting the
+event loop. Hits and followers omit those projection counters. `rows` includes
+its synchronous and yielded intervals; do not add those details to the phase
+total again. `handlerElapsedMs` starts before parameter validation and excludes
+admission before the handler. The `response` phase includes the synchronous response callback. These are elapsed
+durations, not CPU time or proof of client receipt. No query text or session
+contents are included.
 
 ### WS log style
 

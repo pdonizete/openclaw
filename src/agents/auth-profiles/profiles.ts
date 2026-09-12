@@ -80,18 +80,6 @@ function replaceProviderAuthState<T>(
   return Object.keys(next).length > 0 ? next : undefined;
 }
 
-function updateSuccessfulUsageStatsEntry(
-  store: AuthProfileStore,
-  profileId: string,
-  lastUsed?: number,
-): void {
-  store.usageStats = store.usageStats ?? {};
-  store.usageStats[profileId] = resetAuthProfileFailureState(
-    store.usageStats[profileId] ?? {},
-    lastUsed === undefined ? undefined : { lastUsed },
-  );
-}
-
 /** Sets or clears explicit auth profile order for a provider. */
 export async function setAuthProfileOrder(params: {
   agentDir?: string;
@@ -489,7 +477,11 @@ export async function markAuthProfileSuccess(params: {
   const { store, provider, profileId, agentDir } = params;
   const providerKey = resolveProviderIdForAuth(provider);
   const profile = store.profiles[profileId];
-  if (!profile || resolveProviderIdForAuth(profile.provider) !== providerKey) {
+  if (
+    !profile ||
+    profile.setup?.replacement ||
+    resolveProviderIdForAuth(profile.provider) !== providerKey
+  ) {
     return;
   }
   const ownerAgentDir = resolvePersistedAuthProfileOwnerAgentDir({ agentDir, profileId });
@@ -504,7 +496,11 @@ export async function markAuthProfileSuccess(params: {
     profileId,
     updater: (freshStore) => {
       const freshProfile = freshStore.profiles[profileId];
-      if (!freshProfile || resolveProviderIdForAuth(freshProfile.provider) !== providerKey) {
+      if (
+        !freshProfile ||
+        freshProfile.setup?.replacement ||
+        resolveProviderIdForAuth(freshProfile.provider) !== providerKey
+      ) {
         return false;
       }
       // Inherited selection ownership is not defined. Clear shared health in
@@ -512,7 +508,11 @@ export async function markAuthProfileSuccess(params: {
       if (updatesSelection) {
         freshStore.lastGood = replaceProviderAuthState(freshStore.lastGood, providerKey, profileId);
       }
-      updateSuccessfulUsageStatsEntry(freshStore, profileId, inherited ? undefined : lastUsed);
+      freshStore.usageStats ??= {};
+      freshStore.usageStats[profileId] = resetAuthProfileFailureState(
+        freshStore.usageStats[profileId] ?? {},
+        { lastProbeAt: Date.now(), ...(inherited ? {} : { lastUsed }) },
+      );
       applied = true;
       return true;
     },
