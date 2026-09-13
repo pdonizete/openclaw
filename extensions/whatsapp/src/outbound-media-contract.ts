@@ -274,8 +274,7 @@ function getOpusInputRate(buf: Buffer): number | undefined {
 // Ogg/Opus minimal vendor-tag patch: reescreve apenas a página OpusTags,
 // trocando o vendor para "WhatsApp" e zerando comentários. Todas as outras
 // páginas (OpusHead + áudio) ficam byte a byte intactas; CRC Ogg recalculado.
-// Exportado para cobertura de teste direta do patcher de pacotes multi-página.
-export function fixWhatsAppOpusVendor(buf: Buffer): Buffer {
+function fixWhatsAppOpusVendor(buf: Buffer): Buffer {
   const POLY = 0x04c11db7;
   const table = Array.from({ length: 256 }, (_, i) => {
     let r = (i << 24) >>> 0;

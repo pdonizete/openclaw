@@ -1,10 +1,27 @@
-// Unit tests for the WhatsApp Ogg/Opus vendor-tag patcher. The patcher is what
-// makes transcoded voice notes playable on WhatsApp mobile: it rewrites the
-// OpusTags vendor to "WhatsApp" while leaving every other page byte-identical.
-// These tests cover single-page packets, packets spanning multiple Ogg pages,
-// per-page tails, and truncated/invalid streams (which must pass through).
-import { describe, expect, it } from "vitest";
-import { fixWhatsAppOpusVendor } from "./outbound-media-contract.js";
+// Unit tests for the WhatsApp Ogg/Opus vendor-tag patcher, exercised through
+// the public prepareWhatsAppOutboundMedia contract with the ffmpeg transcode
+// mocked (the patcher runs on the mocked transcoded stream). The patcher is
+// what makes transcoded voice notes playable on WhatsApp mobile: it rewrites
+// the OpusTags vendor to "WhatsApp" while leaving every other page
+// byte-identical. These tests cover single-page packets, packets spanning
+// multiple Ogg pages, per-page tails, and truncated/invalid streams (which
+// must pass through unchanged).
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { prepareWhatsAppOutboundMedia } from "./outbound-media-contract.js";
+
+const hoisted = vi.hoisted(() => ({
+  transcodeAudioBufferToOpus: vi.fn(),
+}));
+
+vi.mock("openclaw/plugin-sdk/media-runtime", async () => {
+  const actual = await vi.importActual<typeof import("openclaw/plugin-sdk/media-runtime")>(
+    "openclaw/plugin-sdk/media-runtime",
+  );
+  return {
+    ...actual,
+    transcodeAudioBufferToOpus: hoisted.transcodeAudioBufferToOpus,
+  };
+});
 
 const POLY = 0x04c11db7;
 
@@ -143,8 +160,24 @@ const WHATSAPP_TAGS_BODY = Buffer.concat([
   u32(0),
 ]);
 
-describe("fixWhatsAppOpusVendor", () => {
-  it("rewrites a single-page OpusTags vendor and keeps all other pages byte-identical", () => {
+/** Runs an arbitrary input through the public contract, substituting the given
+ *  stream as the ffmpeg transcode output so the vendor patcher sees it. */
+async function patchTranscodedStream(transcoded: Buffer): Promise<Buffer> {
+  hoisted.transcodeAudioBufferToOpus.mockReset().mockResolvedValue(transcoded);
+  const media = await prepareWhatsAppOutboundMedia({
+    buffer: Buffer.from("input-arbitrary"),
+    contentType: "audio/mpeg",
+    fileName: "voice.mp3",
+  });
+  return media.buffer;
+}
+
+beforeEach(() => {
+  hoisted.transcodeAudioBufferToOpus.mockReset();
+});
+
+describe("fixWhatsAppOpusVendor via prepareWhatsAppOutboundMedia", () => {
+  it("rewrites a single-page OpusTags vendor and keeps all other pages byte-identical", async () => {
     const headPage = buildPage({
       htype: 0x02,
       granule: 0n,
@@ -166,9 +199,8 @@ describe("fixWhatsAppOpusVendor", () => {
       seq: 2,
       body: Buffer.from("AUDIO-DATA"),
     });
-    const input = Buffer.concat([headPage, tagsPage, audioPage]);
 
-    const out = fixWhatsAppOpusVendor(input);
+    const out = await patchTranscodedStream(Buffer.concat([headPage, tagsPage, audioPage]));
 
     const pages = parsePages(out);
     expect(pages).toHaveLength(3);
@@ -181,7 +213,7 @@ describe("fixWhatsAppOpusVendor", () => {
     }
   });
 
-  it("rewrites an OpusTags packet spanning multiple pages and promotes the per-page tail", () => {
+  it("rewrites an OpusTags packet spanning multiple pages and promotes the per-page tail", async () => {
     const headPage = buildPage({
       htype: 0x02,
       granule: 0n,
@@ -219,7 +251,7 @@ describe("fixWhatsAppOpusVendor", () => {
       nextPage,
     ]);
 
-    const out = fixWhatsAppOpusVendor(input);
+    const out = await patchTranscodedStream(input);
 
     const pages = parsePages(out);
     expect(pages).toHaveLength(4);
@@ -241,7 +273,7 @@ describe("fixWhatsAppOpusVendor", () => {
     }
   });
 
-  it("returns the input unchanged when the OpusTags packet never terminates", () => {
+  it("returns the stream unchanged when the OpusTags packet never terminates", async () => {
     const headPage = buildPage({
       htype: 0x02,
       granule: 0n,
@@ -259,10 +291,10 @@ describe("fixWhatsAppOpusVendor", () => {
     });
     const input = Buffer.concat([headPage, truncatedTags]);
 
-    expect(fixWhatsAppOpusVendor(input).equals(input)).toBe(true);
+    expect(await patchTranscodedStream(input)).toEqual(input);
   });
 
-  it("returns the input unchanged when no OpusTags packet exists", () => {
+  it("returns the stream unchanged when no OpusTags packet exists", async () => {
     const headPage = buildPage({
       htype: 0x02,
       granule: 0n,
@@ -279,6 +311,6 @@ describe("fixWhatsAppOpusVendor", () => {
     });
     const input = Buffer.concat([headPage, audioPage]);
 
-    expect(fixWhatsAppOpusVendor(input).equals(input)).toBe(true);
+    expect(await patchTranscodedStream(input)).toEqual(input);
   });
 });
