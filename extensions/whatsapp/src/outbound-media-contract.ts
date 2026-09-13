@@ -197,9 +197,12 @@ export async function prepareWhatsAppOutboundMedia(
       mediaUrl,
     })
   ) {
+    // Entrada arbitrária (MP3, M4A, WebM...): mantém o teto de duração como
+    // proteção contra arquivos malformados/abusivos.
     const buffer = await transcodeToWhatsAppVoiceOpus({
       buffer: media.buffer,
       fileName: media.fileName ?? deriveWhatsAppDocumentFileName(mediaUrl) ?? "audio",
+      maxDurationSeconds: MEDIA_FFMPEG_MAX_AUDIO_DURATION_SECS,
     });
     return { buffer, kind: "audio", mimetype: WHATSAPP_VOICE_MIMETYPE };
   }
@@ -207,6 +210,9 @@ export async function prepareWhatsAppOutboundMedia(
   // (ex.: TTS MiniMax 48 kHz), também transcodifica — WhatsApp mobile não toca 48 kHz.
   const inputRate = media.buffer ? getOpusInputRate(media.buffer) : undefined;
   if (inputRate !== undefined && inputRate !== WHATSAPP_VOICE_SAMPLE_RATE_HZ) {
+    // Áudio nativo Ogg/Opus com taxa incompatível: NÃO aplica teto de duração.
+    // O arquivo já era um voice note válido; cortar a 20 min introduziria perda
+    // silenciosa de conteúdo num fluxo que antes passava intacto.
     const buffer = await transcodeToWhatsAppVoiceOpus({
       buffer: media.buffer,
       fileName: media.fileName ?? deriveWhatsAppDocumentFileName(mediaUrl) ?? "audio",
@@ -234,13 +240,15 @@ function isWhatsAppNativeVoiceAudio(params: {
 async function transcodeToWhatsAppVoiceOpus(params: {
   buffer: Buffer;
   fileName: string;
+  /** Teto de duração repassado ao ffmpeg; omitido preserva a duração completa. */
+  maxDurationSeconds?: number;
 }): Promise<Buffer> {
   const transcoded = await transcodeAudioBufferToOpus({
     audioBuffer: params.buffer,
     inputFileName: params.fileName,
     tempPrefix: "whatsapp-voice-",
     outputFileName: WHATSAPP_VOICE_FILE_NAME,
-    maxDurationSeconds: MEDIA_FFMPEG_MAX_AUDIO_DURATION_SECS,
+    maxDurationSeconds: params.maxDurationSeconds,
     sampleRateHz: WHATSAPP_VOICE_SAMPLE_RATE_HZ,
     channels: 1,
     bitrate: WHATSAPP_VOICE_BITRATE,
@@ -266,7 +274,8 @@ function getOpusInputRate(buf: Buffer): number | undefined {
 // Ogg/Opus minimal vendor-tag patch: reescreve apenas a página OpusTags,
 // trocando o vendor para "WhatsApp" e zerando comentários. Todas as outras
 // páginas (OpusHead + áudio) ficam byte a byte intactas; CRC Ogg recalculado.
-function fixWhatsAppOpusVendor(buf: Buffer): Buffer {
+// Exportado para cobertura de teste direta do patcher de pacotes multi-página.
+export function fixWhatsAppOpusVendor(buf: Buffer): Buffer {
   const POLY = 0x04c11db7;
   const table = Array.from({ length: 256 }, (_, i) => {
     let r = (i << 24) >>> 0;
@@ -325,6 +334,7 @@ function fixWhatsAppOpusVendor(buf: Buffer): Buffer {
     granule: bigint;
     serial: number;
     seq: number;
+    laces: number[];
     body: Buffer;
     raw: Buffer;
   }> = [];
@@ -335,36 +345,152 @@ function fixWhatsAppOpusVendor(buf: Buffer): Buffer {
     const serial = buf.readUInt32LE(off + 14);
     const seq = buf.readUInt32LE(off + 18);
     const nSegs = buf.readUInt8(off + 26);
-    const segs = Array.from(buf.subarray(off + 27, off + 27 + nSegs));
-    const bodyLen = segs.reduce((a, b) => a + b, 0);
+    const laces = Array.from(buf.subarray(off + 27, off + 27 + nSegs));
+    const bodyLen = laces.reduce((a, b) => a + b, 0);
     const body = buf.subarray(off + 27 + nSegs, off + 27 + nSegs + bodyLen);
     pages.push({
       htype,
       granule,
       serial,
       seq,
+      laces,
       body,
       raw: buf.subarray(off, off + 27 + nSegs + bodyLen),
     });
     off += 27 + nSegs + bodyLen;
   }
 
-  let out = Buffer.alloc(0);
-  let fixed = false;
-  for (const p of pages) {
-    if (!fixed && p.body.length >= 8 && p.body.subarray(0, 8).toString("ascii") === "OpusTags") {
-      const vendor = Buffer.from("WhatsApp");
-      const newBody = Buffer.concat([Buffer.from("OpusTags"), u32(vendor.length), vendor, u32(0)]);
-      out = Buffer.concat([
-        out,
-        makePage(p.htype, p.granule, p.serial, p.seq, lace(newBody), newBody),
-      ]);
-      fixed = true;
-    } else {
-      out = Buffer.concat([out, p.raw]);
+  // O pacote OpusTags começa no início de uma página (sem flag de continuação).
+  let tagsPage = -1;
+  for (let i = 0; i < pages.length; i++) {
+    const p = pages[i];
+    if (
+      p !== undefined &&
+      (p.htype & 0x01) === 0 &&
+      p.body.length >= 8 &&
+      p.body.subarray(0, 8).toString("ascii") === "OpusTags"
+    ) {
+      tagsPage = i;
+      break;
     }
   }
-  return fixed ? out : buf;
+  if (tagsPage === -1) {
+    return buf;
+  }
+
+  // Descobrir a extensão do pacote: um lace < 255 encerra o pacote; laces de
+  // 255 continuam para a próxima página. Arquivo truncado no meio do pacote
+  // retorna intacto (nunca produzir framing parcial).
+  let endPage = tagsPage;
+  let endLace = -1;
+  outer: for (let i = tagsPage; i < pages.length; i++) {
+    const p = pages[i];
+    if (p === undefined) {
+      break;
+    }
+    for (let j = 0; j < p.laces.length; j++) {
+      const laceLen = p.laces[j];
+      if (laceLen !== undefined && laceLen < 255) {
+        endPage = i;
+        endLace = j;
+        break outer;
+      }
+    }
+  }
+  if (endLace === -1) {
+    return buf;
+  }
+
+  const vendor = Buffer.from("WhatsApp");
+  const newBody = Buffer.concat([Buffer.from("OpusTags"), u32(vendor.length), vendor, u32(0)]);
+  const newLaces = lace(newBody);
+
+  // Montar a saída: páginas anteriores intactas, pacote OpusTags substituído
+  // por uma única página curta, páginas do pacote antigo descartadas, e a cauda
+  // (se o pacote terminava no meio de uma página) promovida a nova página que
+  // começa o próximo pacote.
+  type OutPage = {
+    htype: number;
+    granule: bigint;
+    serial: number;
+    seq: number;
+    laces: number[];
+    body: Buffer;
+    raw?: Buffer;
+  };
+  const out: OutPage[] = [];
+  for (let i = 0; i < tagsPage; i++) {
+    const p = pages[i];
+    if (p === undefined) {
+      continue;
+    }
+    out.push({
+      htype: p.htype,
+      granule: p.granule,
+      serial: p.serial,
+      seq: p.seq,
+      laces: p.laces,
+      body: p.body,
+      raw: p.raw,
+    });
+  }
+  const tagsSource = pages[tagsPage];
+  if (tagsSource === undefined) {
+    return buf;
+  }
+  out.push({
+    htype: 0x00,
+    granule: tagsSource.granule,
+    serial: tagsSource.serial,
+    seq: -1,
+    laces: newLaces,
+    body: newBody,
+  });
+  const endSource = pages[endPage];
+  if (endSource !== undefined && endLace + 1 < endSource.laces.length) {
+    const tailLaces = endSource.laces.slice(endLace + 1);
+    const tailOffset = endSource.laces.slice(0, endLace + 1).reduce((a, b) => a + b, 0);
+    out.push({
+      htype: 0x00, // começa um pacote novo na primeira lace da cauda
+      granule: endSource.granule,
+      serial: endSource.serial,
+      seq: -1,
+      laces: tailLaces,
+      body: endSource.body.subarray(tailOffset),
+    });
+  }
+  for (let i = endPage + 1; i < pages.length; i++) {
+    const p = pages[i];
+    if (p === undefined) {
+      continue;
+    }
+    out.push({
+      htype: p.htype,
+      granule: p.granule,
+      serial: p.serial,
+      seq: p.seq,
+      laces: p.laces,
+      body: p.body,
+      raw: p.raw,
+    });
+  }
+
+  // Numerar as sequências por serial (a remoção de páginas desloca os números)
+  // e concatenar todos os blocos uma única vez (sem cópia O(n²) no loop).
+  const nextSeqBySerial = new Map<number, number>();
+  const chunks: Buffer[] = [];
+  for (const entry of out) {
+    const nextSeq = nextSeqBySerial.get(entry.serial) ?? 0;
+    nextSeqBySerial.set(entry.serial, nextSeq + 1);
+    if (entry.raw !== undefined && entry.seq === nextSeq) {
+      chunks.push(entry.raw);
+    } else {
+      chunks.push(
+        makePage(entry.htype, entry.granule, entry.serial, nextSeq, entry.laces, entry.body),
+      );
+    }
+  }
+  return Buffer.concat(chunks);
 }
 
 function deriveWhatsAppDocumentFileName(mediaUrl: string | undefined): string | undefined {

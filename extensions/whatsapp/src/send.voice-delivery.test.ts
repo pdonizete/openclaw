@@ -22,6 +22,25 @@ const loadWebMediaMock = vi.fn();
 let sendMessageWhatsApp: typeof import("./send.js").sendMessageWhatsApp;
 const WHATSAPP_TEST_CFG: OpenClawConfig = { channels: { whatsapp: {} } };
 
+// Minimal Ogg page holding an OpusHead packet with the given input sample rate
+// (offset 12 of the OpusHead body), enough for getOpusInputRate to parse.
+function oggOpusHeadBuffer(sampleRate: number): Buffer {
+  const body = Buffer.alloc(19);
+  body.write("OpusHead", 0, "ascii");
+  body.writeUInt8(1, 8);
+  body.writeUInt16LE(2, 9);
+  body.writeUInt16LE(0, 11);
+  body.writeUInt32LE(sampleRate, 12);
+  const segTable = Buffer.from([body.length]);
+  const header = Buffer.alloc(27 + segTable.length);
+  header.write("OggS", 0, "ascii");
+  header[5] = 0x02; // BOS
+  header.writeUInt32LE(1234, 14);
+  header[26] = 1;
+  segTable.copy(header, 27);
+  return Buffer.concat([header, body]);
+}
+
 vi.mock("openclaw/plugin-sdk/channel-activity-runtime", async () => {
   const actual = await vi.importActual<
     typeof import("openclaw/plugin-sdk/channel-activity-runtime")
@@ -369,5 +388,56 @@ describe("WhatsApp gateway voice delivery", () => {
       "audio/ogg; codecs=opus",
     );
     expect(sendMessage).toHaveBeenNthCalledWith(2, "+1555", "voice note", undefined, undefined);
+  });
+
+  it("transcodes native Ogg/Opus with a non-16 kHz header without a duration cap", async () => {
+    const buf = oggOpusHeadBuffer(48000);
+    loadWebMediaMock.mockResolvedValueOnce({
+      buffer: buf,
+      contentType: "audio/ogg",
+      kind: "audio",
+      fileName: "voice.ogg",
+    });
+
+    await sendMessageWhatsApp("+1555", "voice note", {
+      verbose: false,
+      cfg: WHATSAPP_TEST_CFG,
+      mediaUrl: "/tmp/voice.ogg",
+    });
+
+    const args = hoisted.transcodeAudioBufferToOpus.mock.calls[0]?.[0] as
+      | { maxDurationSeconds?: number; audioBuffer?: Buffer; sampleRateHz?: number }
+      | undefined;
+    expect(args?.audioBuffer).toEqual(buf);
+    expect(args?.sampleRateHz).toBe(16000);
+    // Native Ogg/Opus being re-encoded for the mobile client must preserve its
+    // complete duration instead of being silently truncated by the 20-minute cap.
+    expect(args?.maxDurationSeconds).toBeUndefined();
+    expect(sendMessage).toHaveBeenNthCalledWith(
+      1,
+      "+1555",
+      "",
+      Buffer.from("opus-output"),
+      "audio/ogg; codecs=opus",
+    );
+  });
+
+  it("passes native Ogg/Opus with a 16 kHz header through unchanged", async () => {
+    const buf = oggOpusHeadBuffer(16000);
+    loadWebMediaMock.mockResolvedValueOnce({
+      buffer: buf,
+      contentType: "audio/ogg",
+      kind: "audio",
+      fileName: "voice.ogg",
+    });
+
+    await sendMessageWhatsApp("+1555", "voice note", {
+      verbose: false,
+      cfg: WHATSAPP_TEST_CFG,
+      mediaUrl: "/tmp/voice.ogg",
+    });
+
+    expect(hoisted.transcodeAudioBufferToOpus).not.toHaveBeenCalled();
+    expect(sendMessage).toHaveBeenNthCalledWith(1, "+1555", "", buf, "audio/ogg; codecs=opus");
   });
 });
